@@ -1,10 +1,12 @@
-# 羊皮纸，把几块屏幕连起来
+# 我喜欢的羊皮纸配色
+
+最初我只是想给 Herdr 换一个羊皮纸颜色的主题。后来觉得，既然要调整，要不把常用的 Pi、Codex、Claude Code 和 Kimi Code 也一起考虑进去？这里就是整理出来的这套配色。
 
 羊皮纸的主背景是 `#F3EAD3`，正文是墨棕 `#3F382E`。蓝灰用于链接与函数，橄榄绿用于成功和新增，砖红用于错误和删除。完整语义色在 [palette.json](../themes/parchment/palette.json)。
 
-终端背景是整套主题的底。只给 agent 换皮肤，宿主终端仍可能保持深色；先在独立窗口试配套的终端方案，再决定是否写进日常配置。
+试的时候要注意，agent 的主题和宿主终端的背景是两回事。只改前者，终端可能还是深色。我建议先开一个独立窗口，把配套的终端颜色也试一下，觉得合适再放进日常配置。
 
-## 按工具取用
+## 各个工具怎么设置
 
 | 工具 | 文件 | 合并／选择方式 |
 | --- | --- | --- |
@@ -15,7 +17,7 @@
 | Claude Code | [parchment.json](../themes/parchment/claude/parchment.json) | 放到自己的 Claude 配置目录 themes，支持自定义主题的版本可通过 `/theme` 选择 Parchment |
 | Kimi Code | [parchment.json](../themes/parchment/kimi/parchment.json) | 放到自己的 Kimi 配置目录 themes，在 TUI 主题设置中选择 parchment |
 
-这些入口针对本次版本，逐项的实测边界见[验证记录](verification.md)。首次创建主题目录后，已运行的客户端可能需要发现或重载资源；保存草稿，使用工具自己的主题选择入口。
+这些设置对应本次收录的版本，具体测到了哪一步，可以看[验证记录](verification.md)。第一次创建主题目录后，已经打开的客户端可能还没发现它。先保存草稿，再用工具自己的入口重载或选择主题。
 
 Pi 1.3.0 可先做一次临时试用（若已安装同名主题，直接选择它，避免重复资源）：
 
@@ -37,9 +39,9 @@ Herdr 客户端与服务端可能分别保留配色缓存。使用该版本文�
 
 把 [pi-hud.json](../presets/pi/pi-hud.json) 中的 `palette: "theme"` 合并到自己的 HUD 配置，使它读取主题。额度功能在示例中关闭，需要时再按 HUD 文档配置自己的账号。
 
-使用 pi-block-editor、HUD 和 pi-cc-extensions 组合时，把 [pi-cc-extensions.json](../presets/pi/pi-cc-extensions.json) 合并到同名用户配置，让 block editor 拥有首页与输入区、HUD 拥有状态栏；完整分工见 [Pi 配方](pi.md)。HUD 的高档思考等级彩虹与某些插件的独立高亮不完全由主题控制。
+使用 pi-block-editor、HUD 和 pi-cc-extensions 组合时，把 [pi-cc-extensions.json](../presets/pi/pi-cc-extensions.json) 合并到同名用户配置，由 block editor 负责首页与输入区，HUD 负责状态栏；具体分工见 [Pi 插件说明](pi.md)。HUD 的高档思考等级彩虹与某些插件的独立高亮不完全由主题控制。
 
-## 深色备选与恢复
+## 如果还想保留原来的主题
 
 [Catppuccin Frappé](../themes/catppuccin/catppuccin-frappe.json) 和 [Latte](../themes/catppuccin/catppuccin-latte.json) 保留原调色板署名。可按 Pi 主题说明选择单个主题或明暗配对。
 
