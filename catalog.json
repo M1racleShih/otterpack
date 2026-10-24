@@ -1,0 +1,235 @@
+{
+  "schema_version": 1,
+  "snapshot_date": "2026-10-24",
+  "timezone": "Asia/Shanghai",
+  "repositories": [
+    {
+      "id": "herdr-radar",
+      "repository": "https://github.com/M1racleShih/herdr-radar",
+      "commit": "72d93bd55bdb2fdf1da7ff8b18ef5d070a448e6b",
+      "license": "MIT",
+      "distribution": "reference",
+      "local_version": "1.3.20"
+    },
+    {
+      "id": "herdr-remote-solution",
+      "repository": "https://github.com/M1racleShih/herdr-remote-solution",
+      "commit": "b01755f05b01f324d6b3b8052eb392cc1bde7a1e",
+      "license": "AGPL-3.0-or-later",
+      "distribution": "pinned-source-with-patch",
+      "local_version": null,
+      "patch": "patches/herdr-remote-solution/current.patch",
+      "patch_sha256": "f4ef7dfdbcbe468a362f32c7d17884272fee9572e2ff5b7511dd1b9e98edf309",
+      "patched_files": {
+        "relay/herdr_relay.py": "2d96788d41ca279b6f61ecbf76fc19e95fe7e5efef29dfe9a4eaa2631776bfb7",
+        "relay/transcript.py": "fba448f1ceca32eba18a4e94f0a81bb5d13a1687bd8e4a70d8e2dc56df75702d",
+        "tests/run.sh": "8108597fcf10ac9ba7eeac062dfa001dd162de4c595345fd4e84ef13cbfec3bf",
+        "tests/test_herdr_relay.py": "95b9e5bfe60dc5784f405a70767e98963ca07141363bbc59341338b4ed660e25",
+        "tests/test_relay_auth.py": "74bec6f35de1e98d008dc86ca54ece1849db793da1e95013496ea90c9e520401",
+        "tests/test_transcript.py": "69cea1fb067db7716e1297aed73c017a48c35ee369586df6eb1ea9126801471b",
+        "tests/test_web_assets.py": "755bc779c90165cb3f318ca9faf8740a51258e40c81b8b487302423088f0e9fe",
+        "tests/test_web_theme.py": "b66c8f3896f7f8fa0418a13d2cb6442f49067a40d66858134023c2b1a0c5a21f",
+        "tests/web_source.py": "79e172d877fce8a42be3cf3cbc54b5ba69fa2909d350a4526f286e86d806f9b5",
+        "web/app.css": "24de0134e2678e97e537fa887f76464f0cf5692d509026c59d638000a24647fe",
+        "web/index.html": "74e92bb0a47ffb900962813008d16249589d76475935d54daa2439e599c5c461",
+        "web/js/state.js": "5a93e1d5fa66c9c1568b18a38418c4d2d39efc4adbb4d2ed8dc7e49662369c01"
+      }
+    },
+    {
+      "id": "pi-hud",
+      "repository": "https://github.com/M1racleShih/pi-hud",
+      "commit": "4f48d4e0d6e97e17679bc6c20222c3dfa751fe2a",
+      "license": "MIT",
+      "distribution": "pinned-source-with-patch",
+      "local_version": "0.2.1",
+      "patch": "patches/pi-hud/current.patch",
+      "patch_sha256": "be616076c5d3afdbfc9303c6b594bff33aec0e38c50c3abe04839d1db390f957",
+      "patched_files": {
+        "scripts/check.mjs": "4a94d4c0808b5125a82b6fec5f7a26cae47cab30b961b7cdeb17eb3138c35863",
+        "src/config.ts": "126b2fc8f2ae7b05329bd32dd1e7dbb995201d08702d100f7e828eb98abaa601",
+        "src/extension.ts": "c35ba6b5b6be2891b20965613fd14a317ff12871aa8ab125ee6b4d517a0c7281",
+        "src/quota/adapters/kimi.ts": "3a155fd21f6ba6b1a7d22bd83f9342db9d4a9794db959addd59c7e0c8e4dc458",
+        "src/quota/adapters/newapi.ts": "2e896307754e9fd4ed111ce8fcfeadf8218a83e148d2ad7d17c54c55f31685e6",
+        "src/quota/identity.ts": "a0347261eceab287ec1bdf6f6286eceb10eccfffde17888ac8bac52584ceb320",
+        "src/quota/service.ts": "7badc0673cb0d3de7107fc1383d42dd7441ffcabc7e001aac3fdd366b4512968",
+        "src/quota/transport.ts": "cf3b2b787dd26c1271cd6ad7c7c0116e03d893823c0833756b4e256875f9a6f8",
+        "src/quota/types.ts": "f95eb54e2098668dbc6317f1c2639849575813dc6aefa9124c7f775d5082e806",
+        "src/render.ts": "9f28e7d93e13aeb3ecd86e59313850f2176df8e563562db0e7829ec7c6cc1cac",
+        "src/state.ts": "add3dece4fa0244f995d07e07d06ebac1e075a167783fb451be242c934a393f4",
+        "tests/fixtures/newapi-hud.ts": "c540c49a89a62b6fa0c3528fd3a91dd26384fc52082cb42e962da7eb90b8b35f",
+        "tests/footer.test.mjs": "2c5a5639c06c3f3fb40beb89d540ae851b3ea7be76f00316f31fc84d9fcdbec4",
+        "tests/kimi.test.mjs": "6564f68ffa7ad038054aae40353e282453766ecb00575a2ef677205932862afc",
+        "tests/lifecycle.test.mjs": "2c8784610ea79eadd775433bde888a99928dbd5c0b8bb088174437b1367d9097",
+        "tests/newapi.test.mjs": "a54d84916cdc49bab145477c2948bf4ea241866c8f2906b298f1ad260d9b314f",
+        "tests/state.test.mjs": "6129b8b9b6fb877bc519c988bdbda11f95f8d44ae0ad9660b5957ec9d1e40967"
+      }
+    },
+    {
+      "id": "pi-block-editor",
+      "repository": "https://github.com/M1racleShih/pi-block-editor",
+      "commit": "bb42e1ff1f55db0c1bf080fe5631a16ca10648c5",
+      "license": "MIT",
+      "distribution": "reference",
+      "local_version": "0.1.0"
+    },
+    {
+      "id": "pi-provider-model-picker",
+      "repository": "https://github.com/M1racleShih/pi-provider-model-picker",
+      "commit": "94e218dd6a14cf43fab0e4fde0e9c9908412cb16",
+      "license": "MIT",
+      "distribution": "reference",
+      "local_version": "0.1.0"
+    },
+    {
+      "id": "pi-catppuccin-theme",
+      "repository": "https://github.com/M1racleShih/pi-catppuccin-theme",
+      "commit": "6efb6982db64eb6168783d38c60f64305bc7585e",
+      "license": "MIT",
+      "distribution": "reference",
+      "local_version": "1.0.0"
+    },
+    {
+      "id": "dynamic-skills",
+      "repository": "https://github.com/M1racleShih/dynamic-skills",
+      "commit": "c9a633858bb7c9320d71ea75245a1c660348671c",
+      "license": "MIT",
+      "distribution": "reference",
+      "local_version": null
+    },
+    {
+      "id": "cd-connect",
+      "repository": "https://github.com/M1racleShih/cd-connect",
+      "commit": "3d5a52e0fd9f1247b4f75c88aab381273864732c",
+      "license": "MIT",
+      "distribution": "reference",
+      "local_version": "0.5.0"
+    },
+    {
+      "id": "cooking-pi",
+      "repository": "https://github.com/M1racleShih/cooking-pi",
+      "commit": "7d9789cc7cbb7939bd42bf9f73267bbefbcdbbf1",
+      "license": "MIT",
+      "distribution": "reference",
+      "local_version": "0.1.0"
+    },
+    {
+      "id": "qingniao",
+      "repository": "https://github.com/M1racleShih/qingniao",
+      "commit": "5d0cf47e79bd7a0bcd9b0faaa4ec1b3e11edbfcd",
+      "license": "MIT",
+      "distribution": "reference",
+      "local_version": null,
+      "note": "Public reference only; local unpublished work is not bundled."
+    },
+    {
+      "id": "conv-docs",
+      "repository": "https://github.com/M1racleShih/conv-docs",
+      "commit": "3224a59fffe77f5f1776bae911eeef7ca7347448",
+      "license": "MIT",
+      "distribution": "pinned-source-with-patch",
+      "local_version": null,
+      "patch": "patches/conv-docs/current.patch",
+      "patch_sha256": "47aadc8db26e00dee2c5a4437f08117bb248c27eff9dd2c48dec64b8dbcd56f9",
+      "patched_files": {
+        "README.md": "d2569ba980b884ed8cb17a40a2026d4f89ea667fdbd5ae06fbc83e8512b33c0e",
+        "README.zh-CN.md": "1f67714e9c18a23e46662e04c9905866519c052b18cc357634709e20897af673",
+        "scripts/browser-smoke.mjs": "884f3a95cc2d185533c39aed51ef66616c731d83a4e987038a813d4b2965132d",
+        "skills/conv-docs/SKILL.md": "8bcca687d82835f634f38539df517fe8aada9697477663f4fbde903caf8fa218",
+        "src/conv_docs/security.py": "0faea286a8e6bb1f1949a680c4af93340784428eef5e149a7229b34912c0dac2",
+        "src/conv_docs/server.py": "952a9a4156540fa160d0e3bc242c3fd74abd5d354353678443fc95db5200b8ca",
+        "src/conv_docs/web/app.css": "786e86380cd377ddaaf8632c6026aeda7ac339be0e9b4cf95fb23a02a688ed5e",
+        "src/conv_docs/web/index.html": "de7bee6c7b23f60ac62d654fff9bd63309bd03da184086fa85a6fa402de4c760",
+        "tests/test_security.py": "572f4a4eb29a37ce8abfc5e133354508d19c561d8f85ca2f24eb27d5ea2a9e66",
+        "tests/test_server.py": "7b820263a30ff6a945d9208682f6c57dd070e6a93b5f99d4994756062ca6aef8"
+      }
+    }
+  ],
+  "npm_references": [
+    {
+      "name": "pi-web-access",
+      "version": "0.43.0",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/nicobailon/pi-web-access.git"
+      }
+    },
+    {
+      "name": "pi-undo-redo",
+      "version": "0.1.4",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Yueby/pi-undo-redo.git"
+      }
+    },
+    {
+      "name": "pi-codex-compaction",
+      "version": "0.2.3",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/jvm/pi-mono.git",
+        "directory": "packages/pi-codex-compaction"
+      }
+    },
+    {
+      "name": "@juicesharp/rpiv-todo",
+      "version": "2.13.9",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/juicesharp/rpiv-mono.git",
+        "directory": "packages/rpiv-todo"
+      }
+    },
+    {
+      "name": "pi-session-titler",
+      "version": "0.1.0",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/M1racleShih/pi-session-titler.git"
+      }
+    },
+    {
+      "name": "@juicesharp/rpiv-ask-user-question",
+      "version": "2.13.9",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/juicesharp/rpiv-mono.git",
+        "directory": "packages/rpiv-ask-user-question"
+      }
+    },
+    {
+      "name": "@narumitw/pi-goal",
+      "version": "0.54.13",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "https://github.com/narumiruna/pi-extensions",
+        "directory": "packages/pi-goal"
+      }
+    },
+    {
+      "name": "@ff-labs/pi-fff",
+      "version": "0.11.0",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/dmtrKovalenko/fff.git",
+        "directory": "packages/pi-fff"
+      }
+    },
+    {
+      "name": "pi-cc-extensions",
+      "version": "1.0.8",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/minuque/pi-cc-extensions.git"
+      }
+    }
+  ]
+}

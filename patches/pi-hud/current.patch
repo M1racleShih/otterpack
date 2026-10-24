@@ -1,0 +1,1339 @@
+diff --git a/scripts/check.mjs b/scripts/check.mjs
+index ac5d575..94d2d78 100644
+--- a/scripts/check.mjs
++++ b/scripts/check.mjs
+@@ -38,6 +38,8 @@ const allowedBuiltins = {
+   "git.ts": new Set(["node:child_process"]),
+   "text.ts": new Set(["node:util"]),
+   "quota/codex-process.ts": new Set(["node:child_process"]),
++  // Low-frequency SHA-256 credential fingerprint only; no network/file/entropy I/O.
++  "quota/identity.ts": new Set(["node:crypto"]),
+ };
+ // `setFooter` is a single-replacement host slot. The full forbidden-API group still applies
+ // to every source file; only the dedicated surface module may call the slot, and only inside
+@@ -153,8 +155,8 @@ for (const filePath of listSourceFiles()) {
+   assert.equal(result.status, 0, result.stderr);
+ }
+ if (transportSource) {
+-  // The quota service and adapters must stay data-only: no node builtin imports at all.
+-  for (const file of ["quota/service.ts", "quota/types.ts", "quota/identity.ts", "quota/adapters/zai.ts", "quota/adapters/deepseek.ts", "quota/adapters/siliconflow.ts", "quota/adapters/http.ts", "quota/transport.ts"]) {
++  // Service and adapters stay data-only; identity alone has crypto hashing.
++  for (const file of ["quota/service.ts", "quota/types.ts", "quota/identity.ts", "quota/adapters/zai.ts", "quota/adapters/deepseek.ts", "quota/adapters/siliconflow.ts", "quota/adapters/http.ts", "quota/adapters/newapi.ts", "quota/adapters/kimi.ts", "quota/transport.ts"]) {
+     assert.ok(existsSync(join("src", file)), `Expected quota module ${file}`);
+   }
+ }
+diff --git a/src/config.ts b/src/config.ts
+index 88660c4..f1b0970 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -3,8 +3,10 @@ import { open } from "node:fs/promises";
+ import type { FileHandle } from "node:fs/promises";
+ import { homedir } from "node:os";
+ import { isAbsolute, join } from "node:path";
++import { validNewApiMetering } from "./quota/adapters/newapi.ts";
+ import { ZAI_ORIGINS } from "./quota/adapters/zai.ts";
+ import { DEEPSEEK_QUOTA_ORIGIN } from "./quota/adapters/deepseek.ts";
++import { KIMI_QUOTA_ORIGIN } from "./quota/adapters/kimi.ts";
+ import { SILICONFLOW_QUOTA_ORIGIN } from "./quota/adapters/siliconflow.ts";
+ 
+ export const CONFIG_LIMIT = 32 * 1024;
+@@ -32,10 +34,9 @@ export interface GitConfig {
+   timeoutMs: number;
+ }
+ 
+-/** Logical quota adapters. Only `zai` is implemented in this slice; the others are
+- *  reserved names so configurations can be validated (and diagnosed) before their
+- *  account-verified implementations land (docs/PROVIDER-LIMITS-PLAN.zh-CN.md §9). */
+-export type QuotaAdapterName = "zai" | "minimax" | "codex" | "gemini-cli" | "deepseek" | "siliconflow";
++/** Logical quota adapters, including reserved diagnostic names for adapters
++ *  whose account-verified implementations have not landed yet. */
++export type QuotaAdapterName = "zai" | "minimax" | "codex" | "gemini-cli" | "deepseek" | "siliconflow" | "newapi" | "kimi";
+ export type QuotaSourceName = "pi" | "codex-app-server";
+ export type QuotaRegionName = "cn" | "global";
+ export type QuotaPlanName = "personal" | "team";
+@@ -56,6 +57,7 @@ export interface QuotaProfile {
+   projectId?: string;
+   modelIds?: readonly string[];
+   origin?: string;
++  metering?: import("./quota/adapters/newapi.ts").NewApiMetering;
+ }
+ 
+ export interface QuotaConfig {
+@@ -125,7 +127,7 @@ const record = (value: unknown): value is Record<string, unknown> =>
+   value !== null && typeof value === "object" && !Array.isArray(value);
+ const own = (value: object, key: string) => Object.hasOwn(value, key);
+ 
+-const QUOTA_ADAPTERS: readonly QuotaAdapterName[] = ["zai", "minimax", "codex", "gemini-cli", "deepseek", "siliconflow"];
++const QUOTA_ADAPTERS: readonly QuotaAdapterName[] = ["zai", "minimax", "codex", "gemini-cli", "deepseek", "siliconflow", "newapi", "kimi"];
+ const QUOTA_REGIONAL: readonly QuotaAdapterName[] = ["zai", "minimax"];
+ /** Verified plan/queryMode combinations (docs/GLM-PLAN-SCOPES.zh-CN.md §2/§9). The
+  * type=1 `personal` candidate was dropped from scope (owner decision 2026-09-22);
+@@ -136,6 +138,7 @@ const ZAI_MODES: readonly [QuotaPlanName, QuotaQueryMode][] = [["personal", "per
+  *  (zai/minimax) choose by region; balance adapters have one fixed origin each. */
+ export function quotaOriginForAdapter(adapter: QuotaAdapterName, region?: string): string | null {
+   if (adapter === "zai" || adapter === "minimax") return ZAI_ORIGINS[region === "global" ? "global" : "cn"] ?? null;
++  if (adapter === "kimi") return KIMI_QUOTA_ORIGIN;
+   if (adapter === "deepseek") return DEEPSEEK_QUOTA_ORIGIN;
+   if (adapter === "siliconflow") return SILICONFLOW_QUOTA_ORIGIN;
+   return null;
+@@ -149,7 +152,7 @@ const cleanId = (value: unknown, max: number): string | null => {
+ export function normalizeQuotaProfile(input: unknown): Readonly<QuotaProfile> {
+   if (!record(input)) throw new Error("quota profile must be an object");
+   for (const key of Object.keys(input)) {
+-    if (!["id", "providerId", "adapter", "source", "enabled", "region", "plan", "queryMode", "organizationId", "projectId", "modelIds", "origin"].includes(key)) {
++    if (!["id", "providerId", "adapter", "source", "enabled", "region", "plan", "queryMode", "organizationId", "projectId", "modelIds", "origin", "metering"].includes(key)) {
+       throw new Error(`Unknown quota profile key: ${key.slice(0, 80)}`);
+     }
+   }
+@@ -217,14 +220,21 @@ export function normalizeQuotaProfile(input: unknown): Readonly<QuotaProfile> {
+     if (!origin) throw new Error(`quota profile ${id}: origin must be an https URL like https://open.bigmodel.cn`);
+     // §9: the origin must match the adapter's fixed domain table exactly (per region).
+     const tableOrigin = quotaOriginForAdapter(adapter, input.region);
+-    if (tableOrigin === null) {
++    if (tableOrigin === null && adapter !== "newapi") {
+       throw new Error(`quota profile ${id}: origin is not a valid field for adapter ${adapter}`);
+     }
+-    if (origin !== tableOrigin) {
++    if (adapter !== "newapi" && origin !== tableOrigin) {
+       throw new Error(`quota profile ${id}: origin must be ${tableOrigin} for adapter ${adapter}`);
+     }
+     profile.origin = origin;
+   }
++  if (adapter === "newapi" && !profile.origin) throw new Error("newapi requires an explicit HTTPS origin");
++  if (input.metering !== undefined) {
++    if (adapter !== "newapi" || !record(input.metering) || Object.keys(input.metering).some((key) => !["quotaPerUnit", "displayType", "usdExchangeRate"].includes(key))) throw new Error("invalid NewAPI metering");
++    const metering = validNewApiMetering(input.metering);
++    if (!metering) throw new Error("invalid NewAPI metering");
++    profile.metering = Object.freeze(metering);
++  }
+   return Object.freeze(profile);
+ }
+ 
+@@ -234,7 +244,7 @@ export function normalizeQuotaOrigin(value: unknown): string | null {
+   if (typeof value !== "string") return null;
+   const trimmed = value.trim().replace(/\/+$/, "");
+   if (!/^https:\/\/[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::\d{1,5})?$/.test(trimmed)) return null;
+-  return trimmed.toLowerCase();
++  try { return new URL(trimmed).origin; } catch { return null; }
+ }
+ 
+ export function normalizeQuota(input: unknown): Readonly<QuotaConfig> {
+diff --git a/src/extension.ts b/src/extension.ts
+index d0662af..a029a8d 100644
+--- a/src/extension.ts
++++ b/src/extension.ts
+@@ -21,7 +21,7 @@ export const WIDGET_KEY = "pi-hud";
+ export const BRIDGE_EVENT = "pi-hud:update";
+ export const OBSERVED_EVENTS: readonly string[] = Object.freeze([
+   "session_start", "session_shutdown", "session_info_changed", "agent_start", "agent_end", "agent_settled",
+-  "turn_end", "message_start", "message_end", "tool_execution_start", "tool_execution_end", "session_compact",
++  "turn_end", "before_provider_request", "message_start", "message_end", "tool_execution_start", "tool_execution_end", "session_compact",
+   "session_tree", "model_select", "thinking_level_select", "ui_prompt_start", "ui_prompt_end",
+ ]);
+ /**
+@@ -213,6 +213,7 @@ export class HudController {
+         case "agent_end": this.state!.phase = "settling"; break;
+         case "agent_settled": this.state!.settle(); this.wantGit = true; this.ledger?.requestVerify(); this.quota?.notify("settled"); break;
+         case "turn_end": this.ledger?.requestVerify(); changed = false; break;
++        case "before_provider_request": this.state!.requestStart(this.now()); changed = false; break;
+         case "message_start": changed = this.state!.messageStart(event?.message); break;
+         case "message_update":
+           // High-frequency stream bridge: O(1) per delta, fuses after the first sample, and
+@@ -338,7 +339,9 @@ export class HudController {
+       try {
+         const resolved = await registry.getApiKeyAndHeaders(model);
+         if (!resolved || resolved.ok !== true) return null;
+-        return { apiKey: resolved.apiKey, headers: resolved.headers, baseUrl: resolved.baseUrl };
++        // Pi only returns baseUrl when auth overrides the model endpoint.
++        // Otherwise the effective endpoint remains the selected model's baseUrl.
++        return { apiKey: resolved.apiKey, headers: resolved.headers, baseUrl: resolved.baseUrl ?? model.baseUrl };
+       } catch { return null; }
+     };
+   }
+@@ -672,7 +675,7 @@ export class HudController {
+         scope: "since attach/reset", input: this.state?.input ?? 0, output: this.state?.output ?? 0,
+         cacheRead: this.state?.cacheRead ?? 0, cacheWrite: this.state?.cacheWrite ?? 0,
+         cacheHitRate: this.state?.cacheHit ?? null, cost: this.state?.cost ?? 0,
+-        speed: this.state ? { rate: this.state.speedRate, tokens: this.state.speedTokens, ms: this.state.speedMs } : null,
++        speed: this.state ? { rate: this.state.speedRate, tokens: this.state.speedTokens, ms: this.state.speedMs, basis: this.state.speedBasis } : null,
+       },
+       sessionUsage: this.ledger?.inspect() ?? null,
+       coverage: {
+@@ -681,7 +684,7 @@ export class HudController {
+           : "observed since attach/reset; NOT a full-session ledger (the native footer aggregates every session entry)",
+         context: "last observed assistant snapshot, labelled ctx(last); not the host's live context estimate; identical scope in observed and session modes",
+         cacheHit: "most recent valid assistant: cacheRead / (input + cacheRead + cacheWrite); ? when unknown; stays observed-scope even in session mode",
+-        speed: "spd*: average generation speed of the last completed assistant message = reported usage.output / (first content-bearing delta -> message_end); discarded (keeping the previous value) on error/abort, missing usage, no observed first token, sub-50ms windows or a model mismatch; no live estimate while streaming",
++        speed: "NewAPI: spd(e2e)* is reported usage.output / (before_provider_request -> message_end), including TTFT because SSE may be buffered; other providers: spd* is average generation speed of the last completed assistant message = reported usage.output / (first content-bearing delta -> message_end); discarded (keeping the previous value) on error/abort, missing usage, no observed first token, sub-50ms windows or a model mismatch; no live estimate while streaming",
+         sessionLedger: this.config.usageScope === "session"
+           ? (this.ledger?.view() ? "full-session ledger active; status/rebuild/host-call diagnostics above" : "requested but unavailable; explicitly degraded to observed-labelled data")
+           : "inactive; usageScope: session opts in",
+diff --git a/src/quota/identity.ts b/src/quota/identity.ts
+index 9a4b0a5..dec98a2 100644
+--- a/src/quota/identity.ts
++++ b/src/quota/identity.ts
+@@ -17,6 +17,7 @@
+  *
+  * No I/O happens here; the host auth result is injected by the caller.
+  */
++import { createHash } from "node:crypto";
+ import type { QuotaProfile } from "../config.ts";
+ import type { QuotaIdentity, QuotaHostAuth } from "./types.ts";
+ 
+@@ -41,23 +42,17 @@ export function matchProfiles(profiles: readonly QuotaProfile[], model: QuotaMod
+  *  Quota queries only ever compare https origins; plain http yields `null`. */
+ export function originOfBaseUrl(baseUrl: unknown): string | null {
+   if (typeof baseUrl !== "string" || baseUrl.length === 0 || baseUrl.length > 2_048) return null;
+-  const match = /^https:\/\/([^/?#]+)/i.exec(baseUrl.trim());
+-  if (!match) return null;
+-  const host = match[1].toLowerCase();
+-  if (!/^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::\d{1,5})?$/.test(host)) return null;
+-  return `https://${host}`;
++  try {
++    const url = new URL(baseUrl);
++    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return null;
++    return url.origin;
++  } catch { return null; }
+ }
+ 
+-/** FNV-1a 32-bit over the credential material. Output is hex; it is only ever used
+- *  as an in-memory cache-key component and never rendered or logged. */
++/** SHA-256 over high-entropy API credentials; cache-only, never logged. No entropy
++ * acquisition or synchronous I/O. JSON framing also prevents delimiter ambiguity. */
+ export function credentialTag(apiKey: string | null | undefined, organizationId: string | null, projectId: string | null): string {
+-  let hash = 0x811c9dc5;
+-  const input = `${apiKey ?? ""}\n${organizationId ?? ""}\n${projectId ?? ""}`;
+-  for (let index = 0; index < input.length; index++) {
+-    hash ^= input.charCodeAt(index);
+-    hash = Math.imul(hash, 0x01000193) >>> 0;
+-  }
+-  return hash.toString(16).padStart(8, "0");
++  return createHash("sha256").update(JSON.stringify([apiKey ?? "", organizationId, projectId])).digest("hex");
+ }
+ 
+ export interface ScopeReconciliation {
+@@ -124,7 +119,7 @@ export function buildIdentity(profile: QuotaProfile, origin: string, scope: Scop
+     providerId: profile.providerId,
+     adapter: profile.adapter,
+     plan: profile.plan ?? "",
+-    queryMode: profile.queryMode ?? "",
++    queryMode: profile.adapter === "newapi" ? JSON.stringify([profile.metering ?? null, originOfBaseUrl(auth?.baseUrl)]) : profile.queryMode ?? "",
+     origin,
+     organizationId,
+     projectId,
+diff --git a/src/quota/service.ts b/src/quota/service.ts
+index 85413ad..a2ec3c5 100644
+--- a/src/quota/service.ts
++++ b/src/quota/service.ts
+@@ -37,6 +37,9 @@ import type { CodexProcessOptions } from "./codex-process.ts";
+ import { zaiParse, zaiPrepare, ZAI_ORIGINS } from "./adapters/zai.ts";
+ import { deepseekParse, deepseekPrepare, DEEPSEEK_QUOTA_ORIGIN } from "./adapters/deepseek.ts";
+ import { siliconflowParse, siliconflowPrepare, SILICONFLOW_QUOTA_ORIGIN } from "./adapters/siliconflow.ts";
++import { newapiParse, newapiPrepare, newapiStatusParse, applyNewApiMetering } from "./adapters/newapi.ts";
++import type { NewApiMetering, NewApiKeyQuota } from "./adapters/newapi.ts";
++import { kimiParse, kimiPrepare, KIMI_QUOTA_ORIGIN } from "./adapters/kimi.ts";
+ import { codexParse, codexPrepare, CODEX_QUOTA_ORIGIN } from "./adapters/codex.ts";
+ 
+ /** The implemented adapter registry. Structural prepare/parse shapes keep every
+@@ -78,6 +81,16 @@ const ADAPTERS: Readonly<Record<string, QuotaAdapterImpl>> = Object.freeze({
+     prepare: siliconflowPrepare,
+     parse: siliconflowParse,
+   },
++  newapi: {
++    usesScope: false, usesHostAuth: true,
++    originFor: (profile) => profile.origin ?? "",
++    prepare: newapiPrepare, parse: newapiParse,
++  },
++  kimi: {
++    usesScope: false, usesHostAuth: true,
++    originFor: () => KIMI_QUOTA_ORIGIN,
++    prepare: kimiPrepare, parse: kimiParse,
++  },
+   codex: {
+     usesScope: false,
+     usesHostAuth: false,
+@@ -156,6 +169,7 @@ export interface QuotaHudView {
+   /** Main account balance (API adapters): the `account`-scope item, never re-summed. */
+   balance: { amountText: string; currency: string; scope: string } | null;
+   truncated: boolean;
++  keyQuota?: NewApiKeyQuota | null;
+ }
+ 
+ export class QuotaService {
+@@ -169,6 +183,7 @@ export class QuotaService {
+   declare config: QuotaConfig | null;
+   declare model: { provider: string; id: string } | null;
+   declare entries: Map<string, QuotaEntry>;
++  declare meteringCache: Map<string, { value: NewApiMetering | null; expiresAt: number }>;
+   declare currentKey: string | null;
+   declare generation: number;
+   declare timer: TimerHandle | null;
+@@ -176,6 +191,7 @@ export class QuotaService {
+   declare queue: string[];
+   declare queuedGenerations: number[];
+   declare inflight: number;
++  declare cancellations: Set<AbortController>;
+   declare closed: boolean;
+   declare modelStatus: ModelStatus;
+   declare counters: { checks: number; authResolutions: number; requests: number; published: number; discarded: number; queuedDrops: number; evictions: number };
+@@ -191,6 +207,7 @@ export class QuotaService {
+     this.config = null;
+     this.model = null;
+     this.entries = new Map();
++    this.meteringCache = new Map();
+     this.currentKey = null;
+     this.generation = 0;
+     this.timer = null;
+@@ -198,6 +215,7 @@ export class QuotaService {
+     this.queue = [];
+     this.queuedGenerations = [];
+     this.inflight = 0;
++    this.cancellations = new Set();
+     this.closed = false;
+     this.modelStatus = { kind: "none" };
+     this.counters = { checks: 0, authResolutions: 0, requests: 0, published: 0, discarded: 0, queuedDrops: 0, evictions: 0 };
+@@ -218,7 +236,12 @@ export class QuotaService {
+       this.cancelTasks();
+       return;
+     }
+-    if (!wasEnabled || changed) this.notify("enable");
++    if (!wasEnabled || changed) {
++      this.cancelTasks();
++      this.currentKey = null;
++      this.notify("enable");
++      this.publishCurrent();
++    }
+   }
+ 
+   /** Track the current model; a provider/id change is an identity trigger. */
+@@ -227,10 +250,10 @@ export class QuotaService {
+     const changed = (next?.provider ?? "") !== (this.model?.provider ?? "") || (next?.id ?? "") !== (this.model?.id ?? "");
+     this.model = next;
+     if (changed && this.enabled) {
+-      // Identity switch: drop in-flight tasks for the previous identity immediately.
+-      this.generation++;
+-      this.queue = [];
+-      this.queuedGenerations = [];
++      // Hide previous-model values before asynchronous host auth resolves.
++      this.cancelTasks();
++      this.currentKey = null;
++      this.publishCurrent();
+       this.notify("identity");
+     }
+   }
+@@ -269,6 +292,8 @@ export class QuotaService {
+ 
+   /** Cancel timers/queue and invalidate all in-flight results. */
+   cancelTasks() {
++    for (const controller of this.cancellations) controller.abort();
++    this.cancellations.clear();
+     if (this.timer !== null) this.clearTimer(this.timer);
+     this.timer = null;
+     this.pending = null;
+@@ -341,6 +366,11 @@ export class QuotaService {
+       const generation = this.generation;
+       const now = this.now();
+       const snapshot = entry.lastSuccess;
++      // Revalidate origin even on a cache hit: a same-key model may use a relay.
++      if (profile.adapter === "newapi") {
++        const prepared = impl.prepare({ profile, auth, scope });
++        if (prepared.kind === "issue") { this.finishIssue(entry, prepared.issue); return; }
++      }
+       if (snapshot && snapshot.expiresAt > now && trigger !== "manual") {
+         // Fresh cache: publish without any network access. A transient issue from an
+         // earlier manual refresh keeps its own record; the lifecycle stays as published.
+@@ -399,22 +429,53 @@ export class QuotaService {
+     entry.issue = null;
+     this.publishCurrent();
+     let result: QuotaTransportResult;
++    const cancellation = new AbortController();
++    const timeoutMs = profile.adapter === "newapi" ? Math.min(5_000, this.config?.timeoutMs ?? 5_000) : this.config?.timeoutMs ?? 5_000;
++    this.cancellations.add(cancellation);
+     try {
+       result = prepared.kind === "process"
+         ? await this.runProcess(prepared, {
+-            timeoutMs: this.config?.timeoutMs ?? 5_000,
++            timeoutMs,
+             setTimer: this.setTimer,
+             clearTimer: this.clearTimer,
+           })
+         : await quotaFetch(this.fetchLike, prepared.url, prepared.headers, {
+-            timeoutMs: this.config?.timeoutMs ?? 5_000,
++            signal: cancellation.signal,
++            timeoutMs,
+             maxBodyBytes: QUOTA_LIMITS.maxBodyBytes,
+             setTimer: this.setTimer,
+             clearTimer: this.clearTimer,
+           });
++      // Public status never receives auth. Its failure cannot erase a valid Key result.
++      if (profile.adapter === "newapi" && result.kind === "response" && result.status === 200 && !profile.metering &&
++          this.enabled && generation === this.generation) {
++        const cached = this.meteringCache.get(origin);
++        if (!cached || cached.expiresAt <= this.now()) {
++          const metadata = await quotaFetch(this.fetchLike, `${origin}/api/status`, { Accept: "application/json" }, {
++            signal: cancellation.signal,
++            timeoutMs, maxBodyBytes: QUOTA_LIMITS.maxBodyBytes,
++            setTimer: this.setTimer, clearTimer: this.clearTimer,
++          });
++          if (this.enabled && generation === this.generation) {
++            const value = metadata.kind === "response" ? newapiStatusParse(metadata.status, metadata.body) : null;
++            this.meteringCache.delete(origin);
++            this.meteringCache.set(origin, { value, expiresAt: this.now() + (this.config?.ttlMs ?? 300_000) });
++            // A site unit/rate change also invalidates formatted snapshots of other
++            // Keys/profiles at this origin, even if their Key TTL is still fresh.
++            for (const cachedEntry of this.entries.values()) {
++              const success = cachedEntry.lastSuccess;
++              if (success?.origin === origin && success.keyQuota && success.keyQuota.meteringSource !== "config") {
++                cachedEntry.lastSuccess = Object.freeze({ ...success, keyQuota: applyNewApiMetering(success.keyQuota, value, "status") });
++              }
++            }
++            if (this.meteringCache.size > QUOTA_LIMITS.maxIdentities) this.meteringCache.delete(this.meteringCache.keys().next().value as string);
++          }
++        }
++      }
+     } catch {
+       result = { kind: "network", reason: "Error" };
+     } finally {
++      this.cancellations.delete(cancellation);
+       entry.inflight = false;
+       this.inflight = Math.max(0, this.inflight - 1);
+     }
+@@ -431,6 +492,10 @@ export class QuotaService {
+       this.finishIssue(entry, parsed.issue);
+       return;
+     }
++    if (parsed.snapshot.keyQuota) {
++      const meter = profile.metering ?? this.meteringCache.get(origin)?.value ?? null;
++      parsed.snapshot.keyQuota = applyNewApiMetering(parsed.snapshot.keyQuota, meter, profile.metering ? "config" : "status");
++    }
+     const now = this.now();
+     const ttl = this.config?.ttlMs ?? 300_000;
+     entry.lastSuccess = Object.freeze({
+@@ -549,6 +614,7 @@ export class QuotaService {
+       updatedAt: snapshot?.fetchedAt ?? null,
+       buckets,
+       balance,
++      keyQuota: snapshot && !hides ? snapshot.keyQuota ?? null : null,
+       truncated: snapshot?.truncated ?? false,
+     };
+   }
+@@ -570,7 +636,8 @@ export class QuotaService {
+       let entry: QuotaEntry | undefined;
+       for (const candidate of this.entries.values()) {
+         if (candidate.identity.profileId !== profile.id || candidate.identity.providerId !== profile.providerId) continue;
+-        if (!entry || (candidate.lastSuccess && !entry.lastSuccess)) entry = candidate;
++        if (quotaIdentityKey(candidate.identity) === this.currentKey) { entry = candidate; break; }
++        if (!entry || (candidate.lastSuccess?.fetchedAt ?? -1) > (entry.lastSuccess?.fetchedAt ?? -1)) entry = candidate;
+       }
+       const snapshot = entry?.lastSuccess ?? null;
+       return {
+@@ -604,6 +671,14 @@ export class QuotaService {
+                 expiresAt: snapshot.expiresAt,
+                 stale: snapshot.expiresAt <= this.now(),
+                 planLabel: snapshot.planLabel,
++                keyQuota: snapshot.keyQuota ? { ...snapshot.keyQuota,
++                  remaining: snapshot.keyQuota.unlimited ? null : snapshot.keyQuota.remaining,
++                  granted: snapshot.keyQuota.unlimited ? null : snapshot.keyQuota.granted,
++                  remainingText: snapshot.keyQuota.unlimited ? null : snapshot.keyQuota.remainingText,
++                  grantedText: snapshot.keyQuota.unlimited ? null : snapshot.keyQuota.grantedText,
++                  expired: snapshot.keyQuota.expiresAt !== null && snapshot.keyQuota.expiresAt <= this.now(),
++                  rawQuota: { remaining: snapshot.keyQuota.remaining, used: snapshot.keyQuota.used, granted: snapshot.keyQuota.granted },
++                } : null,
+                 balances: snapshot.balances
+                   ? snapshot.balances.map((item) => ({ amountText: item.amountText, currency: item.currency, scope: item.scope }))
+                   : null,
+@@ -645,6 +720,7 @@ export class QuotaService {
+     this.closed = true;
+     this.cancelTasks();
+     this.entries.clear();
++    this.meteringCache.clear();
+   }
+ }
+ 
+diff --git a/src/quota/transport.ts b/src/quota/transport.ts
+index a03e0e9..4566096 100644
+--- a/src/quota/transport.ts
++++ b/src/quota/transport.ts
+@@ -53,6 +53,7 @@ export type QuotaTransportResult =
+   | { kind: "network"; reason: string };
+ 
+ export interface QuotaTransportOptions {
++  signal?: AbortSignal;
+   timeoutMs?: number;
+   maxBodyBytes?: number;
+   /** Injectable timers keep cancellation deterministic in tests. */
+@@ -125,6 +126,9 @@ export async function quotaFetch(
+   const controller = typeof AbortController === "function" ? new AbortController() : null;
+   const setTimer = options.setTimer ?? (setTimeout as unknown as SetTimer);
+   const clearTimer = options.clearTimer ?? (clearTimeout as unknown as ClearTimer);
++  const abort = () => { try { controller?.abort(); } catch { /* Already settled. */ } };
++  options.signal?.addEventListener("abort", abort, { once: true });
++  if (options.signal?.aborted) abort();
+   let timedOut = false;
+   const timer: TimerHandle = setTimer(() => {
+     timedOut = true;
+@@ -139,9 +143,10 @@ export async function quotaFetch(
+       credentials: "omit",
+       signal: controller?.signal,
+     });
+-    if (response.status >= 300 && response.status < 400) return { kind: "redirect", status: response.status };
++    if (response.status >= 300 && response.status < 400) { abort(); return { kind: "redirect", status: response.status }; }
+     const body = await boundedBody(response, maxBytes);
+-    if (body === null) return { kind: "oversized" };
++    if (timedOut) return { kind: "timeout" };
++    if (body === null) { abort(); return { kind: "oversized" }; }
+     return { kind: "response", status: response.status, headers: response.headers, body };
+   } catch (error) {
+     if (timedOut) return { kind: "timeout" };
+@@ -150,5 +155,6 @@ export async function quotaFetch(
+     return { kind: "network", reason };
+   } finally {
+     clearTimer(timer);
++    options.signal?.removeEventListener("abort", abort);
+   }
+ }
+diff --git a/src/quota/types.ts b/src/quota/types.ts
+index 9b442bb..9ba714c 100644
+--- a/src/quota/types.ts
++++ b/src/quota/types.ts
+@@ -108,6 +108,7 @@ export interface QuotaSnapshotData {
+   partial: boolean;
+   /** Optional balance items (unused by the GLM slice). */
+   balances?: readonly QuotaBalanceItem[];
++  keyQuota?: import("./adapters/newapi.ts").NewApiKeyQuota;
+ }
+ 
+ /** A published success snapshot with local timing. */
+@@ -133,8 +134,8 @@ export interface QuotaIdentity {
+ }
+ 
+ export const quotaIdentityKey = (identity: QuotaIdentity): string =>
+-  `${identity.profileId}\\u0000${identity.providerId}\\u0000${identity.origin}\\u0000${identity.plan}\\u0000` +
+-  `${identity.queryMode}\\u0000${identity.organizationId ?? ""}\\u0000${identity.projectId ?? ""}\\u0000${identity.credentialTag}`;
++  JSON.stringify([identity.profileId, identity.providerId, identity.adapter, identity.origin, identity.plan,
++    identity.queryMode, identity.organizationId, identity.projectId, identity.credentialTag]);
+ 
+ /** Host-resolved request auth for the current model (Pi `ResolvedRequestAuth` shape). */
+ export interface QuotaHostAuth {
+diff --git a/src/render.ts b/src/render.ts
+index c6e6686..1e1b081 100644
+--- a/src/render.ts
++++ b/src/render.ts
+@@ -21,6 +21,7 @@ export interface HudWords {
+   session: string;
+   /** Label for the last completed assistant message's average generation speed (`spd*`). */
+   speed: string;
++  speedEndToEnd: string;
+   stopped: string;
+   other: string;
+   /** Label of the opt-in provider-plan quota row (distinct from context usage). */
+@@ -34,8 +35,8 @@ export interface HudWords {
+ }
+ 
+ export const LABELS: Record<HudLanguage, HudWords> = {
+-  en: { context: "ctx(last)", ready: "ready", working: "working", waiting: "waiting", agents: "agents", tasks: "tasks", compact: "compactions*", cost: "est*", usage: "obs*", session: "sess*", speed: "spd*", stopped: "interrupted", other: "other", quotaPlan: "plan", quotaUnconfigured: "no quota source", quotaWeek: "wk", quotaStale: "stale" },
+-  "zh-CN": { context: "上下文(上次)", ready: "就绪", working: "工作中", waiting: "等待确认", agents: "代理", tasks: "任务", compact: "压缩*", cost: "估算*", usage: "观测*", session: "全会话*", speed: "速度*", stopped: "已中断", other: "其他", quotaPlan: "套餐", quotaUnconfigured: "未配置额度来源", quotaWeek: "周", quotaStale: "过期" },
++  en: { context: "ctx(last)", ready: "ready", working: "working", waiting: "waiting", agents: "agents", tasks: "tasks", compact: "compactions*", cost: "est*", usage: "obs*", session: "sess*", speed: "spd*", speedEndToEnd: "spd(e2e)*", stopped: "interrupted", other: "other", quotaPlan: "plan", quotaUnconfigured: "no quota source", quotaWeek: "wk", quotaStale: "stale" },
++  "zh-CN": { context: "上下文(上次)", ready: "就绪", working: "工作中", waiting: "等待确认", agents: "代理", tasks: "任务", compact: "压缩*", cost: "估算*", usage: "观测*", session: "全会话*", speed: "速度*", speedEndToEnd: "吞吐*", stopped: "已中断", other: "其他", quotaPlan: "套餐", quotaUnconfigured: "未配置额度来源", quotaWeek: "周", quotaStale: "过期" },
+ };
+ 
+ /** Fixed layout bounds: a row can never grow past these counts, whatever the state. */
+@@ -378,7 +379,7 @@ export function speedField(snapshot: HudSnapshot, config: HudConfig, words: HudW
+   if (!config.showSpeed || snapshot.speedRate === null) return null;
+   const unit = config.language === "zh-CN" ? "tok/s" : "t/s";
+   const value = snapshot.speedRate > SPEED_DISPLAY_CAP ? `>${SPEED_DISPLAY_CAP}` : snapshot.speedRate.toFixed(1);
+-  return field(28, [seg("label", `${words.speed} `), seg("body", `${value} ${unit}`)]);
++  return field(28, [seg("label", `${snapshot.speedBasis === "end-to-end" ? words.speedEndToEnd : words.speed} `), seg("body", `${value} ${unit}`)]);
+ }
+ 
+ /** Zero compactions or zero observed usage stay hidden instead of padding the row. */
+@@ -395,6 +396,7 @@ export function quotaPlanLabel(planKey: string, language: HudLanguage): string {
+   if (planKey === "deepseek") return "DeepSeek";
+   if (planKey === "siliconflow") return language === "zh-CN" ? "硅基流动" : "SiliconFlow";
+   if (planKey === "codex") return "Codex";
++  if (planKey === "kimi") return "Kimi Code";
+   const clean = planKey.replace(/[^a-zA-Z0-9:_-]/g, "").slice(0, 24);
+   return clean || "plan";
+ }
+@@ -439,12 +441,18 @@ export function quotaField(quota: QuotaHudView | null, config: HudConfig, words:
+   if (quota.status === "ambiguous-profile") {
+     return field(25, [seg("label", `${words.quotaPlan} `), seg("warning", "ambiguous-profile")]);
+   }
+-  const plan = quotaPlanLabel(quota.planKey, language);
++  const plan = quota.planKey === "newapi" ? "NewAPI Key" : quotaPlanLabel(quota.planKey, language);
+   // Balance adapters (DeepSeek/SiliconFlow) have no windows; their row is the plan
+   // identity plus the exact server amount with its currency.
+-  const hasValues = quota.buckets.length > 0 || quota.balance !== null;
++  const hasValues = quota.buckets.length > 0 || quota.balance !== null || !!quota.keyQuota;
+   const valueSegments = (): HudSegment[] => {
+     const segments: HudSegment[] = [];
++    if (quota.keyQuota) {
++      const key = quota.keyQuota;
++      const amount = key.currency === "quota" ? `${key.remainingText} quota` : balanceText(key.remainingText, key.currency, config.ascii);
++      segments.push(seg("separator", config.ascii ? " | " : " · "));
++      segments.push(seg("body", key.unlimited ? (language === "zh-CN" ? "不限额" : "unlimited") : `${language === "zh-CN" ? "剩余" : "remaining"} ${amount}`));
++    }
+     for (const bucket of quota.buckets) {
+       segments.push(seg("separator", config.ascii ? " | " : " · "));
+       const percent = bucket.remainingPercent === undefined ? "?" : `${Math.round(bucket.remainingPercent)}%`;
+diff --git a/src/state.ts b/src/state.ts
+index 005f8c2..34c4d1c 100644
+--- a/src/state.ts
++++ b/src/state.ts
+@@ -23,6 +23,8 @@ export interface ModelLike {
+   id?: string;
+   name?: string;
+   contextWindow?: number;
++  /** Host model endpoint; used only by background quota origin validation. */
++  baseUrl?: string;
+ }
+ 
+ export interface UsageLike {
+@@ -97,6 +99,8 @@ export interface HudSnapshot {
+    * Average generation speed of the most recent completed assistant message:
+    * provider-reported `usage.output` divided by the wall-clock window from the first
+    * content-bearing streaming delta to `message_end` (algorithm: docs/TOKEN-SPEED.zh-CN.md).
++   * NewAPI instead uses before_provider_request to message_end and publishes an end-to-end basis
++   * because its content deltas can arrive as a buffered burst.
+    * `null` before the first measurement and after reset or a model switch; a discarded
+    * measurement never overwrites the previous valid value.
+    */
+@@ -104,6 +108,8 @@ export interface HudSnapshot {
+   /** Exact numerator/denominator of `speedRate`, kept for `/hud status` diagnostics. */
+   speedTokens: number;
+   speedMs: number;
++  /** NewAPI reports request throughput because its stream can be buffered. */
++  speedBasis: "generation" | "end-to-end";
+   cost: number;
+   usageReports: number;
+   costReports: number;
+@@ -159,6 +165,8 @@ export class HudState {
+   declare speedRate: number | null;
+   declare speedTokens: number;
+   declare speedMs: number;
++  declare speedBasis: "generation" | "end-to-end";
++  declare requestStartedAt: number | null;
+   declare streamArmed: boolean;
+   declare firstTokenAt: number | null;
+   declare cost: number;
+@@ -201,6 +209,8 @@ export class HudState {
+     this.speedMs = 0;
+     this.streamArmed = false;
+     this.firstTokenAt = null;
++    this.requestStartedAt = null;
++    this.speedBasis = "generation";
+     this.cost = 0;
+     this.usageReports = 0;
+     this.costReports = 0;
+@@ -222,12 +232,22 @@ export class HudState {
+       this.speedRate = null;
+       this.speedTokens = 0;
+       this.speedMs = 0;
++      this.speedBasis = "generation";
++      this.streamArmed = false;
++      this.firstTokenAt = null;
++      this.requestStartedAt = null;
+     }
+     this.modelKey = key;
+     this.model = safeText(model?.name || model?.id, 80) || "no model";
+     this.contextWindow = number(model?.contextWindow);
+   }
+ 
++  /** Observe only the clock, never the request payload. Older hosts without this event
++   * cannot provide an honest NewAPI request window, so no throughput is published. */
++  requestStart(now: number): void {
++    this.requestStartedAt = this.modelKey.startsWith("newapi:") ? now : null;
++  }
++
+   /**
+    * Arm (assistant) or disarm (any other role) one speed measurement. A `message_start`
+    * of a non-assistant message while armed means the pairing is already broken: discard
+@@ -238,6 +258,7 @@ export class HudState {
+     const changed = armed !== this.streamArmed || (armed && this.firstTokenAt !== null);
+     this.streamArmed = armed;
+     this.firstTokenAt = null;
++    if (!armed) this.requestStartedAt = null;
+     return changed;
+   }
+ 
+@@ -312,6 +333,8 @@ export class HudState {
+   private settleSpeed(message: MessageLike | undefined, now: number): boolean {
+     const armed = this.streamArmed;
+     const firstTokenAt = this.firstTokenAt;
++    const requestStartedAt = this.requestStartedAt;
++    this.requestStartedAt = null;
+     this.streamArmed = false;
+     this.firstTokenAt = null;
+     if (message?.role !== "assistant" || !armed || firstTokenAt === null) return false;
+@@ -324,8 +347,14 @@ export class HudState {
+     // belongs to the old model and must not be displayed next to the new selection.
+     const responseKey = `${safeText(message.provider, 64)}:${safeText(message.model, 100)}`;
+     if (message.model && message.provider && responseKey !== this.modelKey) return false;
+-    const elapsed = now - firstTokenAt;
+-    if (elapsed < MIN_SPEED_WINDOW_MS) return false;
++    // NewAPI can buffer the entire SSE stream. Arrival time would measure the
++    // final network flush, not generation; report explicitly labelled request throughput.
++    const endToEnd = this.modelKey.startsWith("newapi:");
++    const windowStart = endToEnd ? requestStartedAt : firstTokenAt;
++    if (windowStart === null) return false;
++    const elapsed = now - windowStart;
++    if (!Number.isFinite(elapsed) || elapsed < MIN_SPEED_WINDOW_MS) return false;
++    this.speedBasis = endToEnd ? "end-to-end" : "generation";
+     this.speedTokens = output;
+     this.speedMs = elapsed;
+     this.speedRate = output / (elapsed / 1_000);
+@@ -495,7 +524,7 @@ export class HudState {
+       interrupted: this.interrupted, dropped: this.dropped,
+       input: this.input, output: this.output, cacheRead: this.cacheRead, cacheWrite: this.cacheWrite,
+       cacheHit: this.cacheHit, cost: this.cost,
+-      speedRate: this.speedRate, speedTokens: this.speedTokens, speedMs: this.speedMs,
++      speedRate: this.speedRate, speedTokens: this.speedTokens, speedMs: this.speedMs, speedBasis: this.speedBasis,
+       usageReports: this.usageReports, costReports: this.costReports,
+       compactions: this.compactions, lastTool: this.lastTool,
+       runningAgents, agentErrors, agentLabel,
+diff --git a/tests/footer.test.mjs b/tests/footer.test.mjs
+index 98f756d..e11c531 100644
+--- a/tests/footer.test.mjs
++++ b/tests/footer.test.mjs
+@@ -432,3 +432,16 @@ test("the default fixture shows think:max after the model name", () => {
+   const wide = rows(state().snapshot(), "balanced", 180)[0];
+   assert.match(wide, /\[GLM-5\.3\] · think:max · zai/);
+ });
++
++
++test("NewAPI throughput is explicitly labelled on the footer in both languages", () => {
++  const s = new HudState("/tmp/project", { ...MODEL, provider: "newapi" }, 0);
++  s.requestStart(0);
++  s.messageStart({ role: "assistant" });
++  s.messageUpdate({ type: "text_delta", delta: "buffered" }, 9_999);
++  s.messageEnd(assistant({ provider: "newapi", usage: { output: 500 } }), 10_000);
++  for (const [language, label] of [["en", "spd(e2e)*"], ["zh-CN", "吞吐*"]]) {
++    const rows = formatFooter(s.snapshot(), normalizeConfig({ language }), 180, EMPTY_IDENTITY);
++    assert.ok(rows[1].text.includes(`${label} 50.0`), rows[1].text);
++  }
++});
+diff --git a/tests/lifecycle.test.mjs b/tests/lifecycle.test.mjs
+index 840ac58..d197dc6 100644
+--- a/tests/lifecycle.test.mjs
++++ b/tests/lifecycle.test.mjs
+@@ -260,3 +260,26 @@ test("session events clear the armed bridge so no late delta can pair with a new
+   assert.equal(state.firstTokenAt, null);
+   assert.equal(state.speedRate, null, "the observation belongs to the previous epoch");
+ });
++
++
++test("NewAPI throughput starts before HTTP headers and never reads or replaces payloads", () => {
++  const f = controllerFixture();
++  f.ctx.model = { ...f.ctx.model, provider: "newapi" };
++  f.emit("model_select", { model: f.ctx.model });
++  f.clock.advance(1_000);
++  const payload = new Proxy({}, { get() { throw new Error("HUD must not read the payload"); } });
++  assert.equal(f.emit("before_provider_request", { payload }), undefined);
++  f.clock.advance(9_900); // The proxy delays headers as well as content.
++  f.emit("message_start", { message: { role: "assistant" } });
++  f.emit("message_update", { assistantMessageEvent: { type: "text_delta", delta: "buffered" } });
++  f.clock.advance(100);
++  f.emit("message_end", { message: assistant({ provider: "newapi", usage: { output: 1_000 } }) });
++  const speed = f.controller.inspect().observedUsage.speed;
++  assert.deepEqual(speed, { rate: 100, tokens: 1_000, ms: 10_000, basis: "end-to-end" });
++  f.emit("message_start", { message: { role: "assistant" } });
++  f.emit("message_update", { assistantMessageEvent: { type: "text_delta", delta: "no request event" } });
++  f.clock.advance(100);
++  f.emit("message_end", { message: assistant({ provider: "newapi", usage: { output: 1_000 } }) });
++  assert.deepEqual(f.controller.inspect().observedUsage.speed, speed, "a missing request event cannot reuse the previous start");
++  f.controller.stop();
++});
+diff --git a/tests/state.test.mjs b/tests/state.test.mjs
+index c7e3ae1..1716929 100644
+--- a/tests/state.test.mjs
++++ b/tests/state.test.mjs
+@@ -435,3 +435,38 @@ test("malformed stream events cannot arm, throw or fuse", () => {
+   s.messageEnd(assistant(), 61_500);
+   assert.equal(s.speedRate, 5);
+ });
++
++
++test("NewAPI buffered streams measure request throughput, including TTFT", () => {
++  const model = { ...MODEL, provider: "newapi" };
++  const s = new HudState("/tmp/project", model, 0);
++  s.requestStart(1_000);
++  s.messageStart({ role: "assistant" });
++  s.messageUpdate({ type: "thinking_delta", delta: "buffered" }, 10_900);
++  s.messageUpdate({ type: "text_delta", delta: "answer" }, 10_950);
++  s.messageEnd(assistant({ provider: "newapi", usage: { output: 1_000 } }), 11_000);
++  assert.equal(s.speedRate, 100, "the 100ms flush must not yield 10,000 t/s");
++  assert.equal(s.speedMs, 10_000);
++  assert.equal(s.snapshot().speedBasis, "end-to-end");
++  // A sub-50ms flush is still usable when the request window is long enough.
++  s.requestStart(20_000);
++  s.messageStart({ role: "assistant" });
++  s.messageUpdate({ type: "text_delta", delta: "answer" }, 29_999);
++  s.messageEnd(assistant({ provider: "newapi", usage: { output: 500 } }), 30_000);
++  assert.equal(s.speedRate, 50);
++  s.requestStart(40_000);
++  s.messageStart({ role: "assistant" });
++  s.messageEnd(assistant({ provider: "newapi" }), 50_000);
++  assert.equal(s.speedRate, 50, "missing content deltas retain the previous sample");
++  s.requestStart(60_000);
++  s.messageStart({ role: "assistant" });
++  s.messageUpdate({ type: "text_delta", delta: "partial" }, 65_000);
++  s.messageEnd(assistant({ provider: "newapi", stopReason: "aborted" }), 70_000);
++  assert.equal(s.speedRate, 50, "aborted requests retain the previous sample");
++  s.setModel(MODEL);
++  assert.equal(s.speedRate, null);
++  assert.equal(s.requestStartedAt, null);
++  measured(s, { firstAt: 100_000, endAt: 110_000, output: 500 });
++  assert.equal(s.speedRate, 50);
++  assert.equal(s.speedBasis, "generation");
++});
+diff --git a/src/quota/adapters/kimi.ts b/src/quota/adapters/kimi.ts
+new file mode 100644
+index 0000000..8268661
+--- /dev/null
++++ b/src/quota/adapters/kimi.ts
+@@ -0,0 +1,59 @@
++/** Kimi Code subscription windows from the official client's GET /coding/v1/usages.
++ * Contract: moonshotai/kimi-code packages/oauth/src/managed-usage.ts.
++ * Only the fixed mainland origin is verified here. Keys resolved for other
++ * endpoints are refused; no cookies, CLI login, wallet or model probing is used.
++ */
++import type { QuotaProfile } from "../../config.ts";
++import type { QuotaBucket, QuotaHeadersLike, QuotaHostAuth, QuotaIssue, QuotaSnapshotData } from "../types.ts";
++import { originOfBaseUrl } from "../identity.ts";
++import { adapterIssue, bearerAuthorization, httpStatusIssue, isObject, parseJsonPayload } from "./http.ts";
++
++export const KIMI_QUOTA_ORIGIN = "https://api.kimi.com";
++const WINDOWS = [
++  ["limit_5h", "hour", 5], ["limit_7d", "week", 1],
++  ["limit_month_total", "month", 1], ["limit_month_code", "month", 1],
++] as const;
++
++export function kimiPrepare(input: { profile: QuotaProfile; auth: QuotaHostAuth | null }):
++  { kind: "request"; url: string; headers: Record<string, string> } | { kind: "issue"; issue: QuotaIssue } {
++  if (input.profile.origin && input.profile.origin !== KIMI_QUOTA_ORIGIN) {
++    return adapterIssue("needs-verification", false, "profile origin differs from the verified Kimi Code origin");
++  }
++  // Require a known effective model endpoint: a Moonshot API/relay key must not
++  // be treated as a Kimi Code subscription credential.
++  if (originOfBaseUrl(input.auth?.baseUrl) !== KIMI_QUOTA_ORIGIN) {
++    return adapterIssue("needs-verification", false, "model endpoint is not the verified Kimi Code origin");
++  }
++  if (!input.auth?.apiKey) return adapterIssue("needs-auth", false, "no Kimi Code credential resolved");
++  return { kind: "request", url: `${KIMI_QUOTA_ORIGIN}/coding/v1/usages`, headers: {
++    Accept: "application/json", Authorization: bearerAuthorization(input.auth.apiKey),
++  } };
++}
++
++export function kimiParse(status: number, headers: QuotaHeadersLike | null, body: string, context: { now: number }):
++  { kind: "snapshot"; snapshot: QuotaSnapshotData } | { kind: "issue"; issue: QuotaIssue } {
++  const httpIssue = httpStatusIssue(status, headers, context.now);
++  if (httpIssue) return httpIssue;
++  const payload = parseJsonPayload(body);
++  if (!isObject(payload) || !isObject(payload.usages)) return adapterIssue("protocol-error", true, "missing Kimi usages object");
++  const buckets: QuotaBucket[] = [];
++  let ignored = 0;
++  for (const [id, unit, number] of WINDOWS) {
++    const raw = payload.usages[id];
++    if (raw === undefined) continue;
++    if (!isObject(raw)) { ignored++; continue; }
++    const value = raw.used_ratio;
++    const ratio = typeof value === "number" ? value
++      : typeof value === "string" && value.length <= 32 && /^-?\d+(\.\d+)?$/.test(value) ? Number(value) : NaN;
++    if (!Number.isFinite(ratio)) { ignored++; continue; }
++    const usedPercent = Math.min(100, Math.max(0, ratio * 100));
++    const bucket: QuotaBucket = { id, kind: "quota-percent", window: { unit, number }, usedPercent, remainingPercent: 100 - usedPercent };
++    const reset = typeof raw.reset_time === "string" && raw.reset_time.length <= 64
++      && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(raw.reset_time)
++      ? Date.parse(raw.reset_time) : NaN;
++    if (Number.isFinite(reset) && reset > 0 && reset <= 4_102_444_800_000) bucket.resetAt = reset;
++    buckets.push(bucket);
++  }
++  if (!buckets.length) return adapterIssue(ignored ? "protocol-error" : "no-data", true, "no valid Kimi quota window");
++  return { kind: "snapshot", snapshot: { buckets: Object.freeze(buckets), planLabel: "Kimi Code", ignoredBuckets: ignored, truncated: false, partial: ignored > 0 } };
++}
+diff --git a/src/quota/adapters/newapi.ts b/src/quota/adapters/newapi.ts
+new file mode 100644
+index 0000000..5172bdb
+--- /dev/null
++++ b/src/quota/adapters/newapi.ts
+@@ -0,0 +1,98 @@
++/** Explicitly trusted NewAPI origin; Key quota, never an account wallet. */
++import type { QuotaProfile } from "../../config.ts";
++import type { QuotaHostAuth, QuotaHeadersLike, QuotaSnapshotData } from "../types.ts";
++import { originOfBaseUrl } from "../identity.ts";
++import { adapterIssue, bearerAuthorization, httpStatusIssue, isObject, parseJsonPayload } from "./http.ts";
++
++export interface NewApiMetering {
++  quotaPerUnit: number;
++  displayType: "USD" | "CNY" | "QUOTA";
++  usdExchangeRate?: number;
++}
++export interface NewApiKeyQuota {
++  remaining: number;
++  used: number;
++  granted: number;
++  unlimited: boolean;
++  /** Epoch milliseconds; the verified usage endpoint returns seconds. */
++  expiresAt: number | null;
++  metering: NewApiMetering | null;
++  meteringSource: "config" | "status" | "raw";
++  remainingText: string;
++  usedText: string;
++  grantedText: string;
++  currency: "USD" | "CNY" | "quota";
++}
++
++export function validNewApiMetering(value: unknown): NewApiMetering | null {
++  if (!isObject(value) || !Number.isSafeInteger(value.quotaPerUnit) || (value.quotaPerUnit as number) <= 0 ||
++      !["USD", "CNY", "QUOTA"].includes(value.displayType as string)) return null;
++  const rate = value.usdExchangeRate;
++  if (rate !== undefined && (typeof rate !== "number" || rate <= 0 || rate > 1_000_000 || Number(rate.toFixed(8)) !== rate)) return null;
++  if (value.displayType === "CNY" && rate === undefined) return null;
++  return { quotaPerUnit: value.quotaPerUnit as number, displayType: value.displayType as NewApiMetering["displayType"], ...(rate !== undefined ? { usdExchangeRate: rate as number } : {}) };
++}
++
++export function newapiPrepare({ profile, auth }: { profile: QuotaProfile; auth: QuotaHostAuth | null }) {
++  if (!profile.origin || originOfBaseUrl(auth?.baseUrl) !== profile.origin) {
++    return adapterIssue("needs-verification", false, "current model origin does not match the trusted NewAPI origin");
++  }
++  if (!auth?.apiKey) return adapterIssue("needs-auth", false, "no current model key resolved");
++  return { kind: "request" as const, url: `${profile.origin}/api/usage/token/`, headers: { Accept: "application/json", Authorization: bearerAuthorization(auth.apiKey) } };
++}
++
++export function newapiStatusParse(status: number, body: string): NewApiMetering | null {
++  if (status !== 200) return null;
++  const raw = parseJsonPayload(body);
++  if (!isObject(raw) || raw.success !== true || !isObject(raw.data)) return null;
++  const data = raw.data;
++  if (typeof data.display_in_currency !== "boolean") return null;
++  return validNewApiMetering({ quotaPerUnit: data.quota_per_unit, displayType: data.display_in_currency ? data.quota_display_type : "QUOTA", usdExchangeRate: data.usd_exchange_rate });
++}
++
++/** Exact rational rounding, half away from zero. Pinned web precision: two
++ * decimals at |amount| >= 1, four below 1, minimum nonzero magnitude 0.0001.
++ * Raw quota remains available so a rounded/minimum display is never the ledger. */
++export function newapiAmount(quota: number, meter: NewApiMetering | null): string {
++  if (!meter || meter.displayType === "QUOTA") return String(quota);
++  // Canonical fixed decimal also handles valid 1e-7/1e-8 JSON numbers.
++  const rate = meter.displayType === "CNY" ? meter.usdExchangeRate!.toFixed(8) : "1";
++  const [whole, fraction = ""] = rate.split(".");
++  const denominator = BigInt(meter.quotaPerUnit) * 10n ** BigInt(fraction.length);
++  const numerator = BigInt(quota) * BigInt(whole + fraction);
++  const negative = numerator < 0n;
++  const abs = negative ? -numerator : numerator;
++  const digits = abs >= denominator ? 2 : 4;
++  const scale = 10n ** BigInt(digits);
++  let rounded = (abs * scale * 2n + denominator) / (denominator * 2n);
++  if (abs !== 0n && rounded === 0n) rounded = 1n;
++  return `${negative && rounded !== 0n ? "-" : ""}${rounded / scale}.${String(rounded % scale).padStart(digits, "0")}`;
++}
++
++export function newapiParse(status: number, headers: QuotaHeadersLike | null, body: string, context: { now: number }) {
++  const failure = httpStatusIssue(status, headers, context.now);
++  if (failure) return failure;
++  const raw = parseJsonPayload(body);
++  if (!isObject(raw) || typeof raw.code !== "boolean") return adapterIssue("protocol-error", true, "invalid NewAPI envelope");
++  if (!raw.code) return adapterIssue("business-error", true, "NewAPI query failed");
++  const data = raw.data;
++  if (!isObject(data) || typeof data.unlimited_quota !== "boolean" ||
++      ![data.total_available, data.total_used, data.total_granted, data.expires_at].every(Number.isSafeInteger) ||
++      (data.expires_at as number) < 0 || (data.expires_at as number) > 8_640_000_000_000) {
++    return adapterIssue("protocol-error", true, "invalid NewAPI quota fields");
++  }
++  const keyQuota: NewApiKeyQuota = {
++    remaining: data.total_available as number, used: data.total_used as number, granted: data.total_granted as number,
++    unlimited: data.unlimited_quota, expiresAt: data.expires_at === 0 ? null : (data.expires_at as number) * 1000,
++    metering: null, meteringSource: "raw", remainingText: String(data.total_available), usedText: String(data.total_used),
++    grantedText: String(data.total_granted), currency: "quota",
++  };
++  const snapshot: QuotaSnapshotData = { buckets: [], planLabel: "", ignoredBuckets: 0, truncated: false, partial: false, keyQuota };
++  return { kind: "snapshot" as const, snapshot };
++}
++
++export function applyNewApiMetering(key: NewApiKeyQuota, meter: NewApiMetering | null, source: NewApiKeyQuota["meteringSource"]): NewApiKeyQuota {
++  return Object.freeze({ ...key, metering: meter, meteringSource: meter ? source : "raw",
++    currency: !meter || meter.displayType === "QUOTA" ? "quota" : meter.displayType,
++    remainingText: newapiAmount(key.remaining, meter), usedText: newapiAmount(key.used, meter), grantedText: newapiAmount(key.granted, meter) });
++}
+diff --git a/tests/fixtures/newapi-hud.ts b/tests/fixtures/newapi-hud.ts
+new file mode 100644
+index 0000000..271098e
+--- /dev/null
++++ b/tests/fixtures/newapi-hud.ts
+@@ -0,0 +1,24 @@
++/** Real-host test wrapper: synthetic acquisition only, never a real Key/network.
++ * Uses the production controller/event wiring with injectable quota dependencies.
++ */
++import { HudController, OBSERVED_EVENTS, STREAM_EVENTS } from "../../src/extension.ts";
++
++export default function newapiHudFixture(pi) {
++  const controller = new HudController(pi, {
++    quotaAuthResolver: async () => ({ apiKey: "synthetic-not-a-secret", baseUrl: "https://newapi.example/v1" }),
++    quotaFetch: async (url, init) => {
++      if (init.method !== "GET" || init.redirect !== "error" || init.credentials !== "omit") throw new Error("invalid transport policy");
++      let payload;
++      if (url === "https://newapi.example/api/usage/token/") {
++        if (init.headers.Authorization !== "Bearer synthetic-not-a-secret") throw new Error("invalid synthetic auth");
++        payload = { code: true, data: { total_available: 20534246, total_used: 123, total_granted: 20534370, unlimited_quota: false, expires_at: 0 } };
++      } else if (url === "https://newapi.example/api/status") {
++        if (Object.keys(init.headers).some((name) => name.toLowerCase() === "authorization")) throw new Error("public status must not receive auth");
++        payload = { success: true, data: { quota_per_unit: 500000, quota_display_type: "CNY", usd_exchange_rate: 7.3, display_in_currency: true } };
++      } else throw new Error("unrecognized fixture endpoint");
++      return { status: 200, ok: true, headers: { get: () => null }, text: async () => JSON.stringify(payload) };
++    },
++  });
++  for (const name of [...OBSERVED_EVENTS, ...STREAM_EVENTS]) pi.on(name, (event, ctx) => controller.handle(name, event, ctx));
++  pi.registerCommand("hud", { description: "Synthetic NewAPI HUD test", handler: (args, ctx) => controller.command(args, ctx) });
++}
+diff --git a/tests/kimi.test.mjs b/tests/kimi.test.mjs
+new file mode 100644
+index 0000000..320c48f
+--- /dev/null
++++ b/tests/kimi.test.mjs
+@@ -0,0 +1,108 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { normalizeConfig, normalizeQuota } from "../src/config.ts";
++import { kimiPrepare, kimiParse } from "../src/quota/adapters/kimi.ts";
++import { QuotaService } from "../src/quota/service.ts";
++import { quotaField, LABELS } from "../src/render.ts";
++import { FakeClock } from "./helpers.mjs";
++
++const profile = { id: "kimi-code", providerId: "kimi-coding", adapter: "kimi", source: "pi" };
++const auth = { apiKey: "synthetic-key", baseUrl: "https://api.kimi.com/coding/v1" };
++const parse = (data, status = 200, headers = null) => kimiParse(status, headers, JSON.stringify(data), { now: 1_000 });
++const sample = { usages: {
++  limit_5h: { used_ratio: 0.1202, reset_time: "2026-10-21T04:51:17Z" },
++  limit_7d: { used_ratio: 0.0242, reset_time: "2026-10-24T03:51:17Z" },
++} };
++const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
++
++test("Kimi profile accepts only its fixed origin and Pi source", () => {
++  assert.equal(normalizeQuota({ profiles: [profile] }).profiles[0].adapter, "kimi");
++  assert.doesNotThrow(() => normalizeQuota({ profiles: [{ ...profile, origin: "https://api.kimi.com" }] }));
++  assert.throws(() => normalizeQuota({ profiles: [{ ...profile, origin: "https://relay.example" }] }), /origin must be/);
++  assert.throws(() => normalizeQuota({ profiles: [{ ...profile, source: "codex-app-server" }] }), /not valid/);
++});
++
++test("Kimi prepare uses a fixed read-only URL and one Bearer prefix", () => {
++  const request = kimiPrepare({ profile, auth });
++  assert.deepEqual(request, { kind: "request", url: "https://api.kimi.com/coding/v1/usages", headers: { Accept: "application/json", Authorization: "Bearer synthetic-key" } });
++  assert.equal(kimiPrepare({ profile, auth: { ...auth, apiKey: "Bearer synthetic-key" } }).headers.Authorization, "Bearer synthetic-key");
++});
++
++test("Kimi prepare refuses relay, Moonshot API, unverified global and missing endpoints before credentials leave", () => {
++  for (const baseUrl of ["https://relay.example/v1", "https://api.moonshot.cn/v1", "https://api.kimi.ai/coding/v1", "http://api.kimi.com/coding/v1", "https://api.kimi.com@evil.example/v1", "", undefined]) {
++    assert.equal(kimiPrepare({ profile, auth: { ...auth, baseUrl } }).issue.code, "needs-verification");
++  }
++  assert.equal(kimiPrepare({ profile: { ...profile, origin: "https://evil.example" }, auth }).issue.code, "needs-verification");
++  assert.equal(kimiPrepare({ profile, auth: { ...auth, apiKey: "" } }).issue.code, "needs-auth");
++});
++
++test("Kimi ratios remain separate 5h and weekly windows with RFC3339 reset times", () => {
++  const result = parse(sample);
++  assert.equal(result.kind, "snapshot");
++  const [fiveHour, week] = result.snapshot.buckets;
++  assert.deepEqual(fiveHour.window, { unit: "hour", number: 5 });
++  assert.deepEqual(week.window, { unit: "week", number: 1 });
++  assert.ok(Math.abs(fiveHour.remainingPercent - 87.98) < 1e-10);
++  assert.ok(Math.abs(week.remainingPercent - 97.58) < 1e-10);
++  assert.equal(fiveHour.resetAt, Date.parse("2026-10-21T04:51:17Z"));
++  assert.equal(result.snapshot.partial, false);
++});
++
++test("Kimi monthly total and code quotas remain distinct detail buckets", () => {
++  const result = parse({ usages: { limit_month_total: { used_ratio: "0.2" }, limit_month_code: { used_ratio: "0.3" } } });
++  assert.deepEqual(result.snapshot.buckets.map(b => b.id), ["limit_month_total", "limit_month_code"]);
++  assert.deepEqual(result.snapshot.buckets.map(b => b.remainingPercent), [80, 70]);
++});
++
++test("Kimi zero/full/overrun ratios are finite display percentages; bad reset stays unknown", () => {
++  for (const [used_ratio, remaining] of [[0, 100], [1, 0], [1.2, 0], [-0.1, 100]]) {
++    const bucket = parse({ usages: { limit_5h: { used_ratio, reset_time: "invalid" } } }).snapshot.buckets[0];
++    assert.equal(bucket.remainingPercent, remaining);
++    assert.equal(bucket.resetAt, undefined);
++  }
++  assert.equal(parse({ usages: { limit_5h: { used_ratio: 0, reset_time: "2026-10-21" } } }).snapshot.buckets[0].resetAt, undefined);
++});
++
++test("Kimi missing and malformed data never become zero or unlimited", () => {
++  assert.equal(parse({}).issue.code, "protocol-error");
++  assert.equal(parse({ usages: {} }).issue.code, "no-data");
++  assert.equal(kimiParse(200, null, "not JSON", { now: 0 }).issue.code, "protocol-error");
++  for (const used_ratio of [null, true, "", " ", "NaN", "Infinity", {}, "1e999"]) {
++    assert.equal(parse({ usages: { limit_5h: { used_ratio } } }).issue.code, "protocol-error");
++  }
++  const partial = parse({ usages: { ...sample.usages, limit_month_total: { used_ratio: null } } });
++  assert.equal(partial.snapshot.partial, true);
++  assert.equal(partial.snapshot.ignoredBuckets, 1);
++  assert.equal(partial.snapshot.buckets.length, 2);
++});
++
++test("Kimi HTTP errors use existing auth and Retry-After semantics without echoing bodies", () => {
++  assert.equal(parse({ secret: "must-not-echo" }, 401).issue.code, "needs-auth");
++  assert.equal(parse({}, 403).issue.code, "forbidden");
++  assert.equal(parse({}, 429, { get: () => "12" }).issue.retryAt, 13_000);
++  assert.equal(parse({}, 500).issue.code, "http-error");
++});
++
++test("Kimi service resolves Pi auth, renders remaining windows and reuses account quota across models", async () => {
++  const clock = new FakeClock(); let calls = 0;
++  const service = new QuotaService({ now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer,
++    resolveAuth: async () => auth,
++    fetch: async (url, init) => {
++      calls++;
++      assert.equal(url, "https://api.kimi.com/coding/v1/usages");
++      assert.equal(init.method, "GET"); assert.equal(init.redirect, "error"); assert.equal(init.credentials, "omit");
++      return { status: 200, ok: true, headers: { get: () => null }, text: async () => JSON.stringify(sample) };
++    },
++  });
++  try {
++    service.configure(normalizeQuota({ enabled: true, profiles: [profile] }));
++    for (const id of ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k"]) {
++      service.onModel({ provider: "kimi-coding", id }); await flush(); clock.advance(0); await flush();
++      const view = service.view(); assert.equal(view.status, "ready"); assert.equal(view.profileId, "kimi-code");
++      const field = quotaField(view, normalizeConfig({ language: "en" }), LABELS.en);
++      assert.equal(field.text, "Kimi Code · 5h 88% · wk 98%");
++    }
++    assert.equal(calls, 1);
++    assert(!JSON.stringify(service.inspect()).includes(auth.apiKey));
++  } finally { service.dispose(); }
++});
+diff --git a/tests/newapi.test.mjs b/tests/newapi.test.mjs
+new file mode 100644
+index 0000000..956f963
+--- /dev/null
++++ b/tests/newapi.test.mjs
+@@ -0,0 +1,232 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { normalizeConfig, normalizeQuotaProfile } from "../src/config.ts";
++import { newapiParse, newapiPrepare, newapiStatusParse, newapiAmount, validNewApiMetering } from "../src/quota/adapters/newapi.ts";
++import { QuotaService } from "../src/quota/service.ts";
++import { formatHud } from "../src/render.ts";
++import { formatFooter } from "../src/footer.ts";
++import { quotaFetch } from "../src/quota/transport.ts";
++import { controllerFixture } from "./helpers.mjs";
++
++const profile = { id: "key", providerId: "newapi", adapter: "newapi", source: "pi", origin: "https://newapi.example" };
++const auth = { apiKey: "synthetic-key", baseUrl: "https://newapi.example/v1" };
++const fields = { total_available: 20534246, total_used: 123, total_granted: 20534370, unlimited_quota: false, expires_at: 1893456000 };
++const usage = (overrides = {}) => JSON.stringify({ code: true, message: "ok", data: { ...fields, ...overrides } });
++const meter = { quotaPerUnit: 500000, displayType: "CNY", usdExchangeRate: 7.3 };
++const status = JSON.stringify({ success: true, data: { quota_per_unit: 500000, quota_display_type: "CNY", usd_exchange_rate: 7.3, display_in_currency: true } });
++const parse = (body) => newapiParse(200, null, body, { now: 1 });
++const response = (body, code = 200) => ({ status: code, headers: { get: () => null }, text: async () => body });
++const flush = async () => { for (let i = 0; i < 12; i++) await new Promise((resolve) => setTimeout(resolve, 1)); };
++
++test("NewAPI explicit HTTPS config and strict effective origin", () => {
++  assert.equal(normalizeQuotaProfile(profile).adapter, "newapi");
++  assert.equal(newapiPrepare({ profile, auth }).url, `${profile.origin}/api/usage/token/`);
++  assert.equal(normalizeQuotaProfile({ ...profile, origin: "https://newapi.example:443" }).origin, profile.origin);
++  assert.throws(() => normalizeQuotaProfile({ ...profile, origin: "https://newapi.example:99999" }));
++  for (const baseUrl of [undefined, "http://newapi.example/v1", "https://elsewhere.example/v1", "https://newapi.example:8443/v1", "https://user:pass@newapi.example/v1", "https://newapi.example/v1?q=1", "https://newapi.example/v1#x"]) {
++    assert.equal(newapiPrepare({ profile, auth: { ...auth, baseUrl } }).kind, "issue");
++  }
++  for (const origin of [undefined, "http://newapi.example", "https://newapi.example/x", "https://u:p@newapi.example", "https://newapi.example?q=1", "https://newapi.example#x"]) assert.throws(() => normalizeQuotaProfile({ ...profile, origin }));
++  for (const metering of [{}, { ...meter, quotaPerUnit: 0 }, { ...meter, usdExchangeRate: undefined }, { ...meter, extra: true }]) assert.throws(() => normalizeQuotaProfile({ ...profile, metering }));
++});
++
++test("NewAPI strict envelope, safe raw integers, seconds expiry, unlimited negatives", () => {
++  const key = parse(usage()).snapshot.keyQuota;
++  assert.equal(key.granted, fields.total_granted); // not re-summed
++  assert.equal(key.expiresAt, 1893456000000);
++  assert.equal(parse(usage({ expires_at: 0, total_available: 0 })).snapshot.keyQuota.expiresAt, null);
++  assert.equal(parse(usage({ unlimited_quota: true, total_available: -25 })).snapshot.keyQuota.remaining, -25);
++  for (const name of Object.keys(fields)) for (const invalid of [undefined, null, "0", 1.5, Number.MAX_SAFE_INTEGER + 1]) {
++    assert.equal(parse(usage({ [name]: invalid })).kind, "issue", `${name}: ${invalid}`);
++  }
++  assert.equal(parse('{"code":false,"message":"secret"}').issue.code, "business-error");
++  for (const body of ['{}', '{"success":true,"data":{}}', '{"code":200}', 'invalid']) assert.equal(parse(body).issue.code, "protocol-error");
++  for (const code of [401, 403, 429]) assert.equal(newapiParse(code, null, "private", { now: 1 }).kind, "issue");
++});
++
++test("NewAPI decimal integer rounding and public metadata whitelist", () => {
++  assert.equal(newapiAmount(fields.total_available, meter), "299.80");
++  assert.equal(newapiAmount(2500, { quotaPerUnit: 500000, displayType: "USD" }), "0.0050");
++  assert.equal(newapiAmount(-2500, { quotaPerUnit: 500000, displayType: "USD" }), "-0.0050");
++  assert.equal(newapiAmount(25, { quotaPerUnit: 500000, displayType: "USD" }), "0.0001");
++  assert.equal(newapiAmount(1, { quotaPerUnit: 500000, displayType: "USD" }), "0.0001");
++  assert.equal(newapiAmount(500000, { quotaPerUnit: 500000, displayType: "USD" }), "1.00");
++  assert.equal(newapiAmount(502500, { quotaPerUnit: 500000, displayType: "USD" }), "1.01");
++  assert.equal(newapiAmount(123, null), "123");
++  assert.equal(newapiAmount(Number.MAX_SAFE_INTEGER, { quotaPerUnit: 1, displayType: "USD" }), "9007199254740991.00");
++  assert.deepEqual(newapiStatusParse(200, status), meter);
++  assert.equal(newapiStatusParse(503, status), null);
++  assert.equal(newapiStatusParse(200, '{}'), null);
++  assert.equal(validNewApiMetering({ ...meter, usdExchangeRate: 0 }), null);
++  assert.equal(validNewApiMetering({ ...meter, usdExchangeRate: 1e-9 }), null);
++  assert.ok(validNewApiMetering({ ...meter, usdExchangeRate: 1e-8 }));
++  assert.equal(newapiAmount(50000000000000, { ...meter, usdExchangeRate: 1e-8 }), "1.00");
++});
++
++async function serviceFixture(fetch, overrides = {}) {
++  const service = new QuotaService({ fetch, resolveAuth: async () => auth, ...overrides });
++  service.configure(normalizeConfig({ quota: { enabled: true, profiles: [profile] } }).quota);
++  service.onModel({ provider: "newapi", id: "flash" });
++  await flush();
++  return service;
++}
++
++test("NewAPI status is unauthenticated, per-origin TTL, shared Key across models, details and currency", async () => {
++  const calls = [];
++  const service = await serviceFixture(async (url, init) => { calls.push({ url, init }); return response(url.endsWith("/api/status") ? status : usage()); });
++  try {
++    assert.equal(calls.length, 2);
++    assert.equal(calls[0].init.headers.Authorization, "Bearer synthetic-key");
++    assert.deepEqual(calls[1].init.headers, { Accept: "application/json" });
++    assert.equal(service.view().keyQuota.remainingText, "299.80");
++    service.onModel({ provider: "newapi", id: "pro" });
++    assert.equal(service.view().keyQuota, undefined);
++    await flush();
++    assert.equal(calls.length, 2);
++    assert.equal(service.inspect().profileList[0].cache.lastSuccess.keyQuota.meteringSource, "status");
++    assert.ok(!JSON.stringify(service.inspect()).includes("synthetic-key"));
++  } finally { service.dispose(); }
++});
++
++test("NewAPI status failure preserves raw snapshot and config overrides avoid metadata query", async () => {
++  const service = await serviceFixture(async (url) => response(url.endsWith("/api/status") ? '{}' : usage()));
++  assert.equal(service.view().keyQuota.currency, "quota");
++  service.configure(normalizeConfig({ quota: { enabled: true, profiles: [{ ...profile, metering: meter }] } }).quota);
++  await flush();
++  assert.equal(service.view().keyQuota.currency, "CNY");
++  service.dispose();
++});
++
++test("NewAPI key rotation, origin mismatch and metadata change remove old formatted values", async () => {
++  let currentAuth = auth;
++  let calls = 0;
++  const service = await serviceFixture(async (url) => { calls++; return response(url.endsWith("/api/status") ? status : usage()); }, { resolveAuth: async () => currentAuth });
++  currentAuth = { ...auth, apiKey: "second-synthetic-key" };
++  service.notify("settled"); await flush();
++  assert.equal(calls, 3); // status shared across keys
++  currentAuth = { ...currentAuth, baseUrl: "https://other.example/v1" };
++  service.notify("settled"); await flush();
++  assert.equal(calls, 3);
++  assert.equal(service.view().keyQuota, null);
++  currentAuth = auth;
++  service.configure(normalizeConfig({ quota: { enabled: true, profiles: [{ ...profile, metering: { quotaPerUnit: 500000, displayType: "USD" } }] } }).quota);
++  await flush();
++  assert.equal(service.view().keyQuota.remainingText, "41.07");
++  service.dispose();
++});
++
++test("NewAPI off aborts network and refuses late publish", async () => {
++  let signal;
++  let finish;
++  const service = new QuotaService({ resolveAuth: async () => auth, fetch: async (_url, init) => { signal = init.signal; return await new Promise((resolve) => { finish = resolve; }); } });
++  service.configure(normalizeConfig({ quota: { enabled: true, profiles: [profile] } }).quota);
++  service.onModel({ provider: "newapi", id: "flash" }); await flush();
++  service.configure(normalizeConfig().quota);
++  assert.equal(signal.aborted, true);
++  finish(response(usage())); await flush();
++  assert.equal(service.counters.published, 0);
++  assert.equal(service.view(), null);
++  service.dispose();
++});
++
++test("NewAPI metadata expiry changes formatted values without idle polling", async () => {
++  let now = 1000;
++  let calls = 0;
++  let metadata = status;
++  const service = await serviceFixture(async (url) => { calls++; return response(url.endsWith("/api/status") ? metadata : usage()); }, { now: () => now });
++  assert.equal(service.view().keyQuota.currency, "CNY");
++  now += 300001;
++  metadata = JSON.stringify({ success: true, data: { quota_per_unit: 500000, quota_display_type: "USD", display_in_currency: true } });
++  assert.equal(calls, 2);
++  service.notify("settled"); await flush();
++  assert.equal(calls, 4);
++  assert.equal(service.view().keyQuota.currency, "USD");
++  assert.equal(service.view().keyQuota.remainingText, "41.07");
++  service.dispose();
++});
++
++test("NewAPI site metering changes invalidate every cached Key at that origin", async () => {
++  let now = 1000;
++  let currentAuth = auth;
++  let metadata = status;
++  let calls = 0;
++  const service = await serviceFixture(async (url) => { calls++; return response(url.endsWith("/api/status") ? metadata : usage()); }, { now: () => now, resolveAuth: async () => currentAuth });
++  now += 200000;
++  currentAuth = { ...auth, apiKey: "second-synthetic-key" };
++  service.notify("settled"); await flush();
++  assert.equal(service.view().keyQuota.currency, "CNY");
++  now += 100001;
++  metadata = JSON.stringify({ success: true, data: { quota_per_unit: 500000, quota_display_type: "USD", display_in_currency: true } });
++  currentAuth = auth;
++  service.notify("settled"); await flush();
++  assert.equal(service.view().keyQuota.currency, "USD");
++  const previousCalls = calls;
++  currentAuth = { ...auth, apiKey: "second-synthetic-key" };
++  service.notify("settled"); await flush();
++  assert.equal(calls, previousCalls);
++  assert.equal(service.view().keyQuota.currency, "USD");
++  service.dispose();
++});
++
++test("NewAPI metadata failure paths degrade to raw quota", async () => {
++  for (const failure of [response("{}", 401), response("{}", 403), response("{}", 429), response("{}", 302), response("x".repeat(262145)), () => { throw new Error("secret"); }]) {
++    const service = await serviceFixture(async (url) => url.endsWith("/api/status") ? typeof failure === "function" ? failure() : failure : response(usage()));
++    assert.equal(service.view().status, "ready");
++    assert.equal(service.view().keyQuota.currency, "quota");
++    service.dispose();
++  }
++});
++
++test("NewAPI fixed request uses shared redirect/body/timeout protections", async () => {
++  const request = newapiPrepare({ profile, auth });
++  assert.equal((await quotaFetch(async () => response("{}", 302), request.url, request.headers)).kind, "redirect");
++  assert.equal((await quotaFetch(async () => response("x".repeat(262145)), request.url, request.headers)).kind, "oversized");
++  let timer;
++  const resultPromise = quotaFetch(async (_url, init) => await new Promise((_, reject) => {
++    init.signal.addEventListener("abort", () => reject(new Error("secret")), { once: true });
++  }), request.url, request.headers, { setTimer: (callback) => { timer = callback; return 1; }, clearTimer: () => {} });
++  timer();
++  assert.equal((await resultPromise).kind, "timeout");
++});
++
++test("NewAPI controller uses model baseUrl fallback, but auth endpoint override wins", async () => {
++  const fixture = controllerFixture();
++  fixture.controller.quotaModel = { provider: "newapi", id: "flash", baseUrl: auth.baseUrl };
++  fixture.controller.ctx.modelRegistry = { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "synthetic-resolved" }) };
++  const resolve = fixture.controller.quotaAuthResolver();
++  assert.equal((await resolve()).baseUrl, auth.baseUrl);
++  fixture.controller.ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: "synthetic-resolved", baseUrl: "https://override.example/v1" });
++  assert.equal((await resolve()).baseUrl, "https://override.example/v1");
++});
++
++test("NewAPI default-off and headless never resolve auth or query", async () => {
++  let calls = 0;
++  const options = { quotaFetch: async () => { calls++; return response(usage()); }, quotaAuthResolver: async () => { calls++; return auth; } };
++  for (const mode of ["rpc", "json"]) {
++    const fixture = controllerFixture({ mode, ...options, config: { quota: { enabled: true, profiles: [profile] } } });
++    fixture.ctx.hasUI = true;
++    fixture.emit("session_start");
++    fixture.clock.advance(0);
++    await flush();
++    assert.equal(calls, 0);
++  }
++  const service = new QuotaService({ fetch: options.quotaFetch, resolveAuth: options.quotaAuthResolver });
++  service.configure(normalizeConfig().quota); service.onModel({ provider: "newapi", id: "flash" }); service.notify("manual");
++  await flush();
++  assert.equal(calls, 0); service.dispose();
++});
++
++test("NewAPI HUD localized/ASCII fixed rows and unlimited does not show negative balance", async () => {
++  const service = await serviceFixture(async (url) => response(url.endsWith("/api/status") ? status : usage({ unlimited_quota: true, total_available: -50 })));
++  const { controller } = controllerFixture();
++  const snapshot = { ...controller.state.snapshot(), quota: service.view() };
++  for (const language of ["en", "zh-CN"]) for (const ascii of [false, true]) for (const preset of ["minimal", "balanced", "full"]) for (const width of [0, 40, 80, 120, 180]) {
++    const lines = formatHud(snapshot, normalizeConfig({ language, ascii, preset }), width);
++    assert.equal(lines.length, { minimal: 1, balanced: 2, full: 3 }[preset]);
++    assert.ok(!lines.map((line) => line.text).join(" ").includes("-50"));
++    if (width === 180) assert.match(lines.map((line) => line.text).join(" "), language === "en" ? /unlimited/ : /不限额/);
++    const footer = formatFooter(snapshot, normalizeConfig({ language, ascii, preset }), width, { cwd: "~/中文 👩‍💻", provider: "newapi", title: "", branch: null, branchDirty: false });
++    assert.equal(footer.length, { minimal: 2, balanced: 3, full: 4 }[preset]);
++  }
++  service.dispose();
++});

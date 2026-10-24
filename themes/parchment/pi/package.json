@@ -1,0 +1,14 @@
+{
+  "name": "otterpack-parchment",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "themes": [
+      "./parchment.json"
+    ]
+  }
+}

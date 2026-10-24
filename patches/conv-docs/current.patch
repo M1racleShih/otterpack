@@ -1,0 +1,488 @@
+diff --git a/README.md b/README.md
+index 6927f29..4a4b43c 100644
+--- a/README.md
++++ b/README.md
+@@ -67,14 +67,14 @@ Full 0→1 deployment (build → local service → Cloudflare Tunnel → phone a
+ 
+ Notes:
+ 
+-- **Code filtering**: code and data/config files are hidden by default (global `settings.filter_code`, per-entry `--allow-code` override). Plain-text documents and data tables (`txt/log/rst/csv/tsv…`) stay visible. HTML files that load companion `.css` need `--allow-code` for their styles.
++- **Code filtering**: code and data/config files are hidden by default (global `settings.filter_code`, per-entry `--allow-code` override). Plain-text documents and data tables (`txt/log/rst/csv/tsv…`) stay visible. Companion stylesheets need no opt-in: a `.css` referenced by an HTML file via `<link rel="stylesheet">` is served for that page's rendering — and only then; unreferenced `.css` stays hidden.
+ - **Exclude semantics** (simplified .gitignore): a pattern without `/` matches that file name at any depth (`*.env`); with `/` it is relative to the root (`secrets/**`, `build/*`). Excluded paths are enforced server-side — hidden from listings and 404 on direct access.
+ - **Previews**: re-previewing the same path replaces the old entry and resets the clock; expired/burned entries disappear automatically.
+ 
+ ## Development & verification
+ 
+ ```bash
+-uv run pytest                               # 77 unit tests: auth, read-only, path sandbox, tickets, headers, code filter, excludes, previews
++uv run pytest                               # 85 unit tests: auth, read-only, path sandbox, tickets, headers, code filter, companion stylesheets, excludes, previews
+ TOKEN=<token> node scripts/browser-smoke.mjs # headless-Chrome end-to-end: login → browse → render → sandbox (18 checks; fixture root needs --allow-code)
+ npm install && npm run build                # rebuild the TypeScript viewer (web-src/app.ts → src/conv_docs/web/app.js)
+ ```
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index 3bc6803..4f1b08c 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -67,14 +67,14 @@ uv run conv-docs serve                 # 127.0.0.1:8380
+ 
+ 说明：
+ 
+-- **代码过滤**：代码与数据/配置文件默认不可见（全局 `settings.filter_code`，条目级 `--allow-code` 覆盖）；纯文本文档与数据表（`txt/log/rst/csv/tsv…`）仍可见。伴生 `.css` 的 HTML 需 `--allow-code` 才能渲染样式。
++- **代码过滤**：代码与数据/配置文件默认不可见（全局 `settings.filter_code`，条目级 `--allow-code` 覆盖）；纯文本文档与数据表（`txt/log/rst/csv/tsv…`）仍可见。伴生样式表免配置：HTML 以 `<link rel="stylesheet">` 引用的 `.css` 会随页面渲染送出，且仅限这一种情况——未被引用的 `.css` 仍不可见。
+ - **exclude 语义**（类 .gitignore 简化版）：不含 `/` 的模式匹配任意层文件名（`*.env`）；含 `/` 则相对发布根（`secrets/**`、`build/*`）。被排除路径服务端强制——列表隐藏、直访 404。
+ - **预览**：同路径再次 preview 替换旧条目并重置计时；过期/烧尽条目自动清理。
+ 
+ ## 开发与验证
+ 
+ ```bash
+-uv run pytest                               # 77 项单测：认证、只读、路径沙箱、ticket、响应头、代码过滤、exclude、预览
++uv run pytest                               # 85 项单测：认证、只读、路径沙箱、ticket、响应头、代码过滤、伴生样式表、exclude、预览
+ TOKEN=<token> node scripts/browser-smoke.mjs # 无头 Chrome 端到端：登录→浏览→渲染→沙箱（18 项断言；夹具根需 --allow-code 发布）
+ npm install && npm run build                # 重建 TypeScript 查看器（web-src/app.ts → src/conv_docs/web/app.js）
+ ```
+diff --git a/scripts/browser-smoke.mjs b/scripts/browser-smoke.mjs
+index 2ca7278..1336267 100644
+--- a/scripts/browser-smoke.mjs
++++ b/scripts/browser-smoke.mjs
+@@ -4,9 +4,9 @@
+  *
+  *   TOKEN=... BASE=http://127.0.0.1:8380 node scripts/browser-smoke.mjs
+  *
+- * 夹具要求：ROOT（默认 ai-fundamentals）需以 --allow-code 发布
+- * （HTML 样式表 style.css 属 code 类，需放行才能验证样式内联），
+- * 且目录中应有一个 code 文件（code/sample.py）用于验证默认代码过滤。
++ * 夹具要求：ROOT（默认 ai-fundamentals）需以 --allow-code 发布（2b 需要
++ * 可见的 code 文件验证高亮渲染），且目录中应有一个 code 文件（code/sample.py）。
++ * 样式内联不再依赖 --allow-code：被 HTML 引用的伴生样式表服务端自动放行。
+  *
+  * 通过 DevTools 协议驱动无头 Chrome：登录 → 浏览发布目录 →
+  * Markdown 渲染 → HTML 安全渲染（脚本/事件被剥离）→ 完整模式沙箱断言。
+diff --git a/skills/conv-docs/SKILL.md b/skills/conv-docs/SKILL.md
+index 2bcd65c..b1b7754 100644
+--- a/skills/conv-docs/SKILL.md
++++ b/skills/conv-docs/SKILL.md
+@@ -76,7 +76,8 @@ After previewing/publishing, tell the user the entry name and where to find it
+ 
+ 2. **Source code and structured data are hidden by default** (`.py/.ts/...`, json/yaml/toml,
+    Dockerfile...). Add `--allow-code` only when the user explicitly wants code visible.
+-   HTML files that load companion `.css` need `--allow-code` for their styles to render.
++   HTML companion stylesheets need no opt-in: a `.css` referenced via `<link rel="stylesheet">`
++   is served for rendering — and only then; unreferenced `.css` stays hidden.
+ 
+ 3. **`--docs-only`** is the strictest tier (markdown/html/image/pdf only).
+ 
+diff --git a/src/conv_docs/security.py b/src/conv_docs/security.py
+index 8b666d1..2471171 100644
+--- a/src/conv_docs/security.py
++++ b/src/conv_docs/security.py
+@@ -96,6 +96,9 @@ def raw_content_type(name: str, kind: str) -> str:
+         }.get(ext, "application/octet-stream")
+     if kind == "pdf":
+         return "application/pdf"
++    if kind == "code" and name.rsplit(".", 1)[-1].lower() == "css":
++        # 伴生样式表按 text/css 返回（仍然永远不是 text/html）
++        return "text/css; charset=utf-8"
+     return "text/plain; charset=utf-8"
+ 
+ 
+@@ -204,6 +207,144 @@ def excluded(rel: str, compiled: list[tuple[re.Pattern, bool, str]], *, is_dir:
+     return False
+ 
+ 
++# ---------- 伴生样式表（HTML companion stylesheet） ----------
++#
++# 代码过滤默认挡住 .css（CODE_EXTS）。但 HTML 文档的呈现离不开伴生样式表，
++# 一刀切会让发布出去的 HTML 丢样式。精确放行：仅当 .css 被同一发布根内的
++# HTML 文档以 <link rel="stylesheet" href="…"> 引用时才可取；未被引用的
++# .css 与其余代码文件照旧不可见（列表不出现、直访 404）。
++# exclude 仍然最优先——被排除的 .css 即使被引用也拒绝。
++
++_LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
++_ATTR_RE = re.compile(
++    r'''([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))'''
++)
++# 外链/协议/根绝对路径：不属于「伴生」，不做放行
++_EXTERNAL_HREF_RE = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|//|/)")
++
++
++def html_stylesheet_refs(text: str, base_dir: str) -> set[str]:
++    """提取 HTML 文档引用的伴生样式表，返回发布根相对 posix 路径集合。
++
++    - 只收 ``<link rel="stylesheet" href="相对路径">``；外链、带协议、
++      根绝对路径（``/…``）都不收；
++    - href 去掉 query/fragment，按 base_dir（HTML 所在目录）解析 ``..``；
++    - 解析后越出发布根的引用直接丢弃。
++    """
++    refs: set[str] = set()
++    base_parts = [p for p in (base_dir or "").replace("\\", "/").split("/") if p and p != "."]
++    for tag in _LINK_TAG_RE.findall(text):
++        attrs: dict[str, str] = {}
++        for match in _ATTR_RE.finditer(tag):
++            value = next((g for g in match.groups()[1:] if g is not None), "")
++            attrs[match.group(1).lower()] = value
++        if "stylesheet" not in (attrs.get("rel") or "").lower().split():
++            continue
++        href = (attrs.get("href") or "").strip()
++        href = href.split("#", 1)[0].split("?", 1)[0].strip()
++        if not href or _EXTERNAL_HREF_RE.match(href):
++            continue
++        parts = list(base_parts)
++        escaped = False
++        for seg in href.replace("\\", "/").split("/"):
++            if seg in ("", "."):
++                continue
++            if seg == "..":
++                if not parts:
++                    escaped = True
++                    break
++                parts.pop()
++            else:
++                parts.append(seg)
++        if escaped:
++            continue
++        refs.add("/".join(parts))
++    return refs
++
++
++class CompanionStylesheets:
++    """判定 .css 是否为发布根内某 HTML 文档的伴生样式表。
++
++    扫描有上限（文件数/单文件大小），结果带 TTL 缓存，避免客户端反复
++    触发整树扫描。规模超限按「不是伴生」处理（保守拒绝）。
++    """
++
++    def __init__(self, *, max_files: int = 400, max_file_bytes: int = 2_000_000,
++                 ttl: float = 30.0, max_cache: int = 512):
++        self.max_files = max_files
++        self.max_file_bytes = max_file_bytes
++        self.ttl = ttl
++        self.max_cache = max_cache
++        self._cache: dict[tuple, tuple[float, bool]] = {}
++        self._lock = threading.Lock()
++
++    def referenced(self, root: str, css_rel: str, *, skip_hidden: bool = True,
++                   excludes: list[str] | None = None) -> bool:
++        """css_rel（发布根相对路径）是否为某 HTML 文档的伴生样式表。
++
++        exclude 优先：被排除的 .css 即使被引用也不放行（与 _resolve 的
++        服务端强制双保险）。
++        """
++        css_rel = (css_rel or "").replace("\\", "/").strip("/")
++        if not css_rel.lower().endswith(".css"):
++            return False
++        compiled = compile_excludes(excludes or [])
++        if compiled and excluded(css_rel, compiled):
++            return False
++        root_real = os.path.realpath(root)
++        key = (root_real, css_rel, skip_hidden, tuple(excludes or []))
++        now = time.monotonic()
++        with self._lock:
++            hit = self._cache.get(key)
++            if hit and now - hit[0] < self.ttl:
++                return hit[1]
++        result = self._scan(root_real, css_rel, skip_hidden, compiled)
++        with self._lock:
++            if len(self._cache) >= self.max_cache:
++                self._cache.clear()
++            self._cache[key] = (now, result)
++        return result
++
++    def _scan(self, root_real: str, css_rel: str, skip_hidden: bool,
++              compiled: list) -> bool:
++        seen = 0
++        for dirpath, dirnames, filenames in os.walk(root_real, followlinks=False):
++            rel_dir = os.path.relpath(dirpath, root_real).replace(os.sep, "/")
++            if rel_dir == ".":
++                rel_dir = ""
++            if skip_hidden:
++                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
++            if compiled:
++                dirnames[:] = [
++                    d for d in dirnames
++                    if not excluded("/".join(p for p in (rel_dir, d) if p), compiled, is_dir=True)
++                ]
++            for name in filenames:
++                if skip_hidden and name.startswith("."):
++                    continue
++                if not name.lower().endswith((".html", ".htm")):
++                    continue
++                child_rel = "/".join(p for p in (rel_dir, name) if p)
++                if compiled and excluded(child_rel, compiled):
++                    continue
++                seen += 1
++                if seen > self.max_files:
++                    return False
++                full = os.path.join(dirpath, name)
++                if os.path.islink(full):
++                    continue  # 符号链接不当作引用来源
++                try:
++                    if os.path.getsize(full) > self.max_file_bytes:
++                        continue
++                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
++                        text = fh.read()
++                except OSError:
++                    continue
++                if css_rel in html_stylesheet_refs(text, rel_dir):
++                    return True
++        return False
++
++
+ # ---------- 认证失败限速 ----------
+ 
+ class AuthRateLimiter:
+diff --git a/src/conv_docs/server.py b/src/conv_docs/server.py
+index fba7282..cca00cc 100644
+--- a/src/conv_docs/server.py
++++ b/src/conv_docs/server.py
+@@ -19,12 +19,14 @@ from urllib.parse import parse_qs, unquote, urlsplit
+ from . import __version__
+ from .security import (
+     AuthRateLimiter,
++    CompanionStylesheets,
+     PathViolation,
+     classify,
+     compile_excludes,
+     excluded,
+     raw_content_type,
+     resolve_within,
++    safe_rel,
+ )
+ from .store import ConfigStore, Publish, default_state_dir
+ 
+@@ -424,6 +426,19 @@ class DocgateHandler(BaseHTTPRequestHandler):
+             "max_render_bytes": self.store.max_render_bytes,
+         })
+ 
++    def _companion_stylesheet(self, pub: Publish, full: str) -> bool:
++        """`.css` 是否为同发布根内 HTML 文档的伴生样式表（精确放行判定）。
++
++        只放宽代码过滤这一道；路径沙箱、exclude、隐藏文件检查均已在
++        _resolve 通过（exclude 永远优先）。列表接口不走这里，.css 依旧
++        不出现在目录里。
++        """
++        if classify(full) != "code" or not full.lower().endswith(".css"):
++            return False
++        return self.server.stylesheets.referenced(
++            pub.path, safe_rel(full, pub.path),
++            skip_hidden=self.store.skip_hidden, excludes=pub.excludes)
++
+     def _api_raw(self, query: dict):
+         try:
+             pub, full = self._resolve(query, need_file=True)
+@@ -431,7 +446,10 @@ class DocgateHandler(BaseHTTPRequestHandler):
+             return self.send_error_json(404, str(exc))
+         kind = classify(full)
+         if not self._kind_allowed(pub, kind):
+-            return self.send_error_json(404, "unsupported file type")
++            # 伴生样式表精确放行：被同发布根内 HTML 引用的 .css 可取，
++            # 供 viewer 内联渲染；其余 code 类照旧 404。
++            if not self._companion_stylesheet(pub, full):
++                return self.send_error_json(404, "unsupported file type")
+         if pub.once:
+             self.store.mark_burned(pub.name)  # 阅后即焚：首次内容访问起算宽限窗
+         size = os.path.getsize(full)
+@@ -495,6 +513,7 @@ class DocgateServer(ThreadingHTTPServer):
+         self.store = store
+         self.limiter = AuthRateLimiter()
+         self.tickets = TicketStore()
++        self.stylesheets = CompanionStylesheets()
+         self.audit = audit or AuditLog()
+ 
+ 
+diff --git a/src/conv_docs/web/app.css b/src/conv_docs/web/app.css
+index 79af9c5..29883a9 100644
+--- a/src/conv_docs/web/app.css
++++ b/src/conv_docs/web/app.css
+@@ -42,7 +42,7 @@ body {
+   color: var(--fg);
+   font: 16px/1.7 -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+ }
+-header {
++header.app-bar {
+   position: sticky;
+   top: 0;
+   z-index: 10;
+@@ -53,8 +53,8 @@ header {
+   background: var(--card);
+   border-bottom: 1px solid var(--border);
+ }
+-header .brand { font-weight: 700; text-decoration: none; color: var(--fg); font-size: 16px; }
+-header .spacer { flex: 1; }
++header.app-bar .brand { font-weight: 700; text-decoration: none; color: var(--fg); font-size: 16px; }
++header.app-bar .spacer { flex: 1; }
+ .icon-btn {
+   border: 1px solid var(--border);
+   background: var(--card);
+@@ -65,7 +65,7 @@ header .spacer { flex: 1; }
+   cursor: pointer;
+ }
+ .icon-btn:active { transform: scale(0.97); }
+-main { max-width: 860px; margin: 0 auto; padding: 16px 14px 70px; }
++main#app { max-width: 860px; margin: 0 auto; padding: 16px 14px 70px; }
+ h1 { font-size: 21px; margin: 12px 0 4px; line-height: 1.4; }
+ h2 { font-size: 18px; margin: 22px 0 8px; }
+ h3 { font-size: 16px; margin: 18px 0 6px; }
+diff --git a/src/conv_docs/web/index.html b/src/conv_docs/web/index.html
+index 1f3721a..ded9db2 100644
+--- a/src/conv_docs/web/index.html
++++ b/src/conv_docs/web/index.html
+@@ -15,7 +15,7 @@
+ <script src="/app.js" defer></script>
+ </head>
+ <body>
+-<header>
++<header class="app-bar">
+   <a class="brand" href="#/"><img src="/favicon.svg" alt="" width="22" height="22">conv-docs</a>
+   <div class="spacer"></div>
+   <button id="lang-btn" class="icon-btn" type="button" title="Switch language">中文</button>
+diff --git a/tests/test_security.py b/tests/test_security.py
+index 21a9314..31c224f 100644
+--- a/tests/test_security.py
++++ b/tests/test_security.py
+@@ -10,10 +10,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
+ 
+ from conv_docs.security import (  # noqa: E402
+     AuthRateLimiter,
++    CompanionStylesheets,
+     PathViolation,
+     classify,
+     compile_excludes,
+     excluded,
++    html_stylesheet_refs,
+     raw_content_type,
+     resolve_within,
+     verify_token,
+@@ -138,6 +140,80 @@ class ExcludeTests(unittest.TestCase):
+         self.assertEqual(raw_content_type("a.png", "image"), "image/png")
+         self.assertEqual(raw_content_type("a.svg", "image"), "image/svg+xml")
+         self.assertEqual(raw_content_type("a.pdf", "pdf"), "application/pdf")
++        self.assertEqual(raw_content_type("a.css", "code"), "text/css; charset=utf-8")
++
++
++class CompanionStylesheetTests(unittest.TestCase):
++    """伴生样式表精确放行：只认同发布根内 HTML 的 rel=stylesheet 引用。"""
++
++    def test_refs_extraction_resolves_relative(self):
++        html = (
++            "<html><head>"
++            '<link rel="stylesheet" href="../assets/site.css?v=2#frag">'
++            "<link rel='stylesheet' href='local.css'>"
++            '<link rel="icon" href="no.css">'
++            '<link rel="stylesheet preload" href="both.css">'
++            '<link rel="stylesheet" href="https://cdn.example/x.css">'
++            '<link rel="stylesheet" href="//cdn.example/x.css">'
++            '<link rel="stylesheet" href="/root.css">'
++            '<link rel="stylesheet" href="data:text/css,body{}">'
++            '<link rel="stylesheet" href="../../escape.css">'
++            "</head></html>"
++        )
++        self.assertEqual(
++            html_stylesheet_refs(html, "pages"),
++            {"assets/site.css", "pages/local.css", "pages/both.css"},
++        )
++
++    def test_refs_rejects_escape_and_empty(self):
++        self.assertEqual(html_stylesheet_refs("<html></html>", ""), set())
++        self.assertEqual(html_stylesheet_refs('<link rel="stylesheet" href="../x.css">', ""), set())
++
++    def test_scan_finds_companion_and_rejects_orphan(self):
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        root = os.path.join(tmp.name, "root")
++        os.makedirs(os.path.join(root, "pages"))
++        os.makedirs(os.path.join(root, "secrets"))
++        os.makedirs(os.path.join(root, ".hidden"))
++        fixtures = {
++            "pages/a.html": ('<link rel="stylesheet" href="../style.css">'
++                             '<link rel="stylesheet" href="../secrets/hidden.css">'),
++            "style.css": "body{}\n",
++            "orphan.css": "body{}\n",
++            "secrets/hidden.css": "body{}\n",
++            ".hidden/b.html": '<link rel="stylesheet" href="../h.css">',
++            "h.css": "body{}\n",
++        }
++        for rel, content in fixtures.items():
++            full = os.path.join(root, rel)
++            os.makedirs(os.path.dirname(full), exist_ok=True)
++            with open(full, "w") as fh:
++                fh.write(content)
++        checker = CompanionStylesheets()
++        self.assertTrue(checker.referenced(root, "style.css"))
++        self.assertFalse(checker.referenced(root, "orphan.css"))  # 未被引用 → 不放行
++        self.assertFalse(checker.referenced(root, "h.css"))  # 引用方在隐藏目录 → 无效
++        # exclude 最优先：被排除的 .css 即使被引用也不放行
++        self.assertFalse(checker.referenced(
++            root, "secrets/hidden.css", excludes=["secrets/**"]))
++        self.assertTrue(checker.referenced(root, "secrets/hidden.css"))  # 无 exclude 时仍算伴生
++        # 非 .css 一律不认
++        self.assertFalse(checker.referenced(root, "style.css/../x.txt"))
++
++    def test_scan_respects_max_files(self):
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        root = os.path.join(tmp.name, "root")
++        os.makedirs(root)
++        for i in range(5):
++            with open(os.path.join(root, f"p{i}.html"), "w") as fh:
++                fh.write('<link rel="stylesheet" href="s.css">')
++        with open(os.path.join(root, "s.css"), "w") as fh:
++            fh.write("body{}\n")
++        checker = CompanionStylesheets(max_files=0)
++        self.assertFalse(checker.referenced(root, "s.css"))  # 超限 → 保守拒绝
++        self.assertTrue(CompanionStylesheets().referenced(root, "s.css"))  # 正常上限内能找到
+ 
+ 
+ class TokenTests(unittest.TestCase):
+diff --git a/tests/test_server.py b/tests/test_server.py
+index 195e4b9..8e37e5f 100644
+--- a/tests/test_server.py
++++ b/tests/test_server.py
+@@ -305,6 +305,16 @@ class FeatureTests(unittest.TestCase):
+             "secrets/key.pem": "PRIVATE",
+             "nested/prod.env": "SECRET=1\n",
+             "nested/ok.md": "ok\n",
++            # 伴生样式表：site.html 引用 assets/site.css（应放行）与
++            # secrets/hidden.css（exclude 优先，仍拒绝）；orphan.css 无人引用
++            "site.html": "<html><head><link rel=\"stylesheet\" href=\"assets/site.css\">"
++                         "<link rel=\"stylesheet\" href=\"secrets/hidden.css\">"
++                         "</head><body>hi</body></html>",
++            "pages/deep.html": "<html><head><link rel=\"stylesheet\" href=\"../assets/site.css\">"
++                              "</head><body>hi</body></html>",
++            "assets/site.css": "body{color:#123}\n",
++            "assets/orphan.css": "body{color:#f00}\n",
++            "secrets/hidden.css": "body{}\n",
+         }
+         for rel, content in files.items():
+             full = os.path.join(cls.main_dir, rel)
+@@ -368,10 +378,30 @@ class FeatureTests(unittest.TestCase):
+     def test_code_hidden_by_default(self):
+         status, _, data = self.authed("/api/v1/tree?root=main&path=")
+         names = {e["name"] for e in self.json_of(data)["entries"]}
+-        self.assertEqual(names, {"readme.md", "plain.txt", "nested"})  # app.py/cfg.toml 不见
++        self.assertEqual(names, {"readme.md", "plain.txt", "site.html",
++                                "assets", "pages", "nested"})  # app.py/cfg.toml 不见
+         status, _, _ = self.authed("/api/v1/raw?root=main&path=app.py")
+         self.assertEqual(status, 404)  # 直访也被拒
+ 
++    # ---------- 伴生样式表精确放行 ----------
++
++    def test_companion_stylesheet_served_without_allow_code(self):
++        status, headers, _ = self.authed("/api/v1/raw?root=main&path=assets/site.css")
++        self.assertEqual(status, 200)
++        self.assertTrue(headers["Content-Type"].startswith("text/css"))
++
++    def test_unreferenced_stylesheet_still_hidden(self):
++        status, _, _ = self.authed("/api/v1/raw?root=main&path=assets/orphan.css")
++        self.assertEqual(status, 404)
++
++    def test_stylesheet_exclude_wins_over_companion(self):
++        status, _, _ = self.authed("/api/v1/raw?root=main&path=secrets/hidden.css")
++        self.assertEqual(status, 404)
++
++    def test_stylesheet_never_listed(self):
++        status, _, data = self.authed("/api/v1/tree?root=main&path=assets")
++        self.assertEqual(self.json_of(data)["entries"], [])
++
+     def test_code_visible_with_allow_code(self):
+         status, _, data = self.authed("/api/v1/tree?root=codews&path=")
+         names = {e["name"] for e in self.json_of(data)["entries"]}

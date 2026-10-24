@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.png binary
+# Patch context contains significant spaces; preserve it byte for byte.
+*.patch -text -whitespace

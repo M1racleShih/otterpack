@@ -1,0 +1,16 @@
+{
+  "paper": "#F3EAD3",
+  "side": "#E7DCC2",
+  "panel": "#EBDFC4",
+  "selected": "#E3D4B4",
+  "text": "#3F382E",
+  "muted": "#645949",
+  "accent": "#7C5328",
+  "green": "#3F6040",
+  "red": "#943D35",
+  "blue": "#345F7A",
+  "purple": "#6C4F7A",
+  "add": "#DFE7D2",
+  "remove": "#F0DCD1",
+  "border": "#A9997D"
+}

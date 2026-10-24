@@ -1,0 +1,1641 @@
+diff --git a/relay/herdr_relay.py b/relay/herdr_relay.py
+index 66a5cc5..6741342 100644
+--- a/relay/herdr_relay.py
++++ b/relay/herdr_relay.py
+@@ -4,7 +4,7 @@
+ # dependencies = ["websockets>=14.0", "zeroconf>=0.80.0", "pywebpush>=2.0.0", "py-vapid>=1.9.0"]
+ # ///
+ """herdr-remote relay — polls herdr, accepts push events (HTTP POST + WebSocket + UDP), broadcasts to clients."""
+-import asyncio, hashlib, json, logging, os, re, shlex, shutil, signal, socket, subprocess, threading, time
++import asyncio, hashlib, json, logging, os, re, secrets, shlex, shutil, signal, socket, subprocess, threading, time
+ 
+ try:
+     from websockets.asyncio.server import serve
+@@ -157,6 +157,90 @@ push_subscriptions = []  # list of PushSubscription dicts
+ PUSH_SUBS_FILE = os.path.join(LOG_DIR, "push_subs.json")
+ ACTIVE_SESSIONS_FILE = os.path.join(LOG_DIR, "active_sessions.json")
+ 
++# --- Browser session cookies ---
++# The bootstrap hop (below, in process_request) exchanges ?token= for one of these: a random id,
++# never the token itself, so what sits in the browser is useless without this file. Ids are stored
++# beside a fingerprint of the current token -- rotating HERDR_RELAY_TOKEN retires every issued
++# session at once, which is the rotation story a raw-token cookie never had.
++AUTH_SESSIONS_FILE = os.path.join(LOG_DIR, "auth_sessions.json")
++# __Host- pins the cookie to this exact origin: Secure, Path=/ and no Domain, so no sibling
++# subdomain ever sees it. HttpOnly keeps it away from any script on the page.
++AUTH_SESSION_COOKIE = "__Host-herdr_session"
++auth_sessions = {}  # session id -> token fingerprint
++
++# Served instead of the app for the one browser load that carries ?token=. The token is never
++# echoed into the HTML -- the script reads it off location.search -- so this page is static and
++# nothing secret is rendered into it.
++BOOTSTRAP_HTML = """<!doctype html>
++<meta charset="utf-8">
++<title>herdr</title>
++<script>
++(function () {
++  var params = new URLSearchParams(location.search);
++  var t = params.get('token');
++  if (t) { try { localStorage.setItem('herdr_relay_token', t); } catch (e) {} }
++  // location.replace swaps this very history entry for the bare URL: the token is gone from the
++  // address bar, from Referer on every later navigation, and from browser history as well.
++  params.delete('token');
++  var q = params.toString();
++  location.replace(location.pathname + (q ? '?' + q : ''));
++})();
++</script>
++"""
++
++
++def _token_fingerprint():
++    if not AUTH_TOKEN:
++        return ""
++    return hashlib.sha256(AUTH_TOKEN.encode("utf-8")).hexdigest()[:16]
++
++
++def _load_auth_sessions():
++    """Restore issued sessions. Mirrors _load_push_subs: never raises, drops what it cannot trust.
++
++    A fingerprint mismatch means the token rotated after this id was minted -- the entry dies on
++    load, so a rotation can never leave old sessions standing."""
++    global auth_sessions
++    auth_sessions = {}
++    if not os.path.isfile(AUTH_SESSIONS_FILE):
++        return
++    try:
++        with open(AUTH_SESSIONS_FILE) as f:
++            stored = json.load(f)
++        if not isinstance(stored, dict):
++            return
++    except Exception:
++        return
++    fingerprint = _token_fingerprint()
++    for sid, fp in stored.items():
++        if isinstance(sid, str) and sid and fp == fingerprint:
++            auth_sessions[sid] = fp
++
++
++def _save_auth_sessions():
++    """BLOCKING. Temp file plus rename, like _write_activity: a crash mid-write must not leave a
++    half file behind that then logs every phone out."""
++    tmp = AUTH_SESSIONS_FILE + ".tmp"
++    with open(tmp, "w") as f:
++        json.dump(auth_sessions, f)
++    os.replace(tmp, AUTH_SESSIONS_FILE)
++
++
++def issue_auth_session():
++    sid = secrets.token_urlsafe(32)
++    auth_sessions[sid] = _token_fingerprint()
++    # dict is insertion-ordered: retire the oldest ids first. The cap is insurance against a loop,
++    # not a defence -- whoever can mint sessions holds the token already.
++    while len(auth_sessions) > 32:
++        auth_sessions.pop(next(iter(auth_sessions)))
++    _save_auth_sessions()
++    return sid
++
++
++def auth_session_cookie_header(sid):
++    return (f"{AUTH_SESSION_COOKIE}={sid}; Path=/; Max-Age=31536000;"
++            " Secure; HttpOnly; SameSite=Lax")
++
+ 
+ ACTIVITY_FILE = os.path.join(LOG_DIR, "activity.json")
+ # Entries untouched for this long are dropped on load -- a backstop for panes whose removal we
+@@ -740,6 +824,7 @@ async def send_web_push(title: str, body: str, url: str = "/", clear: bool = Fal
+ 
+ _load_push_subs()
+ _load_active_sessions()
++_load_auth_sessions()
+ _load_activity()
+ 
+ 
+@@ -2775,6 +2860,8 @@ async def process_request(connection, request):
+ 
+     public_paths = {"/sw.js", "/api/vapid-public-key"}
+     request_path = (request.path or "/").split("?", 1)[0]
++    from_query = False  # did this request carry ?token= (the one moment the secret rides in a URL)
++    session_id = None   # a session cookie, if the caller sent one
+ 
+     # Token auth (if configured). Static assets under web/ are exempt because a browser fetches
+     # the stylesheet, the scripts and the fonts before anything has authenticated, and the
+@@ -2791,18 +2878,24 @@ async def process_request(connection, request):
+             _, qs = request.path.split("?", 1) if "?" in request.path else (request.path, "")
+             params = urllib.parse.parse_qs(qs)
+             token = params.get("token", [None])[0]
+-        # And the cookie the index response plants below. A PWA's manifest start_url is a bare
+-        # "/", so launching from the home screen arrives with no query token and 401s before a
+-        # line of JS runs -- localStorage cannot help, the document fetch precedes it.
++            from_query = token is not None
++        # And cookies. A PWA's manifest start_url is a bare "/", so launching from the home screen
++        # arrives with no query token and 401s before a line of JS runs -- localStorage cannot help,
++        # the document fetch precedes it. The session cookie is a random id minted by the bootstrap
++        # hop below and bound to a fingerprint of the token, so rotating the token retires it; the
++        # legacy herdr_token cookie carried the raw token and is still honored, so an
++        # already-logged-in phone is not bounced on upgrade.
+         if not token:
+             for key, value in request.headers.raw_items():
+                 if key.lower() != "cookie":
+                     continue
+                 for part in value.split(";"):
+                     name, _, val = part.strip().partition("=")
+-                    if name == "herdr_token":
++                    if name == AUTH_SESSION_COOKIE:
++                        session_id = val
++                    elif name == "herdr_token" and not token:
+                         token = val
+-        if token != AUTH_TOKEN:
++        if session_id not in auth_sessions and token != AUTH_TOKEN:
+             headers = Headers([("Content-Type", "text/plain")])
+             return Response(401, "Unauthorized", headers, b"Invalid token\n")
+ 
+@@ -2850,6 +2943,26 @@ async def process_request(connection, request):
+             headers = Headers([("Access-Control-Allow-Origin", "*")])
+             return Response(200, "OK", headers, b"ok\n")
+ 
++    # The bootstrap hop. A browser arriving at ?token= is the one moment the long-lived secret
++    # rides in a URL -- exactly the habit OWASP's session guidance tells us to stop. This response
++    # exchanges it for a session cookie and immediately puts the bare URL in its place
++    # (location.replace, so the tokened entry never even rests in browser history). The app is
++    # then loaded -- and every later request made -- without the token in any URL. Non-HTML callers
++    # (curl, the native clients, a WebSocket handshake) keep their ?token= semantics unchanged.
++    if AUTH_TOKEN and from_query:
++        accept = ""
++        for key, value in request.headers.raw_items():
++            if key.lower() == "accept":
++                accept = value.lower()
++        if "text/html" in accept and getattr(request, "method", "GET").upper() == "GET":
++            sid = issue_auth_session()
++            headers = Headers([
++                ("Content-Type", "text/html; charset=utf-8"),
++                ("Cache-Control", "no-store"),
++                ("Set-Cookie", auth_session_cookie_header(sid)),
++            ])
++            return Response(200, "OK", headers, BOOTSTRAP_HTML.encode("utf-8"))
++
+     # Serve web app for GET / or GET /index.html
+     path = (request.path or "/").split("?")[0]
+     if path in ("/", "/index.html"):
+@@ -2863,11 +2976,13 @@ async def process_request(connection, request):
+                 ("Cache-Control", "no-cache"),
+             ]
+             if AUTH_TOKEN:
+-                # Getting here means this request already authenticated, so plant the token for
+-                # the tokenless loads that follow -- the PWA launch, and any bare bookmark.
+-                fields.append(("Set-Cookie",
+-                               f"herdr_token={AUTH_TOKEN}; Path=/; Max-Age=31536000;"
+-                               " HttpOnly; SameSite=Lax"))
++                # Getting here means this request already authenticated. Mint (or keep) a session
++                # cookie for the tokenless loads that follow -- the PWA launch, any bare bookmark.
++                # The cookie value is a random session id, never the raw token (see the bootstrap
++                # hop); the legacy herdr_token cookie is accepted on the way in but never issued
++                # again.
++                sid = session_id if session_id in auth_sessions else issue_auth_session()
++                fields.append(("Set-Cookie", auth_session_cookie_header(sid)))
+             return Response(200, "OK", Headers(fields), body)
+ 
+     # Serve service worker
+diff --git a/relay/transcript.py b/relay/transcript.py
+index fdcbb37..2b6b264 100644
+--- a/relay/transcript.py
++++ b/relay/transcript.py
+@@ -8,12 +8,15 @@ does reach older rows -- a `recent` + text read, which walks the agent's own mou
+ terminal. The agent writes its own transcript anyway, with real message boundaries and timestamps,
+ so that is what we read.
+ 
+-Claude and pi JSONL are both understood. Adding another harness means adding a locate+parse pair
+-and one line in HARNESSES (plus PATH_HARNESSES if it hands over a file path rather than a uuid) --
+-nothing else in here or in the relay is harness-specific.
++Claude, Codex, pi and kimi-code transcripts are all understood. Adding another harness means adding a
++locate+parse pair, one line in HARNESSES (plus PATH_HARNESSES if it hands over a file path rather
++than an id) and, when its session ids are not bare uuids, one line in ID_VALUE_RES -- nothing else
++in here or in the relay is harness-specific.
+ """
+ import difflib
++from datetime import datetime, timezone
+ import glob
++import hashlib
+ import json
+ import os
+ import re
+@@ -26,6 +29,12 @@ import threading
+ # ever allowed past it.
+ UUID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+ 
++# kimi-code names its sessions `session_<uuid>`, and the whole value is the session DIRECTORY's
++# name under ~/.kimi-code/sessions -- the prefix is as load-bearing as the hex, so it is validated
++# as part of the value rather than stripped, exactly as constrained as a bare uuid.
++SESSION_ID_RE = re.compile(r"\Asession_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
++                           r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
++
+ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]")
+ 
+ COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.S)
+@@ -66,11 +75,17 @@ def _roots_env(name, default):
+ 
+ ENABLED = os.environ.get("HERDR_TRANSCRIPT", "1").strip().lower() not in {"0", "false", "no", "off"}
+ LOCAL_ROOTS = _roots_env("HERDR_CLAUDE_ROOTS", [os.path.expanduser("~/.claude/projects")])
++CODEX_ROOTS = _roots_env("HERDR_CODEX_ROOTS", [os.path.join(
++    os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex"), "sessions")])
+ # pi writes one JSONL per session under here; its session ref hands over the absolute path
+ # (kind "path"), so these roots are a containment check rather than a search space.
+ PI_ROOTS = _roots_env("HERDR_PI_ROOTS", [os.path.expanduser("~/.pi/agent/sessions")])
++# kimi-code writes one directory per session (`<root>/<workspace>/session_<uuid>/agents/main/`);
++# its session ref hands over the `session_<uuid>` leaf (kind "id"), which locate globs for.
++KIMI_ROOTS = _roots_env("HERDR_KIMI_ROOTS", [os.path.expanduser("~/.kimi-code/sessions")])
+ # Remote roots stay unexpanded: they are shell words for the remote host, whose $HOME is not ours.
+ REMOTE_ROOTS = _roots_env("HERDR_REMOTE_CLAUDE_ROOTS", ["$HOME/.claude/projects"])
++REMOTE_CODEX_ROOTS = _roots_env("HERDR_REMOTE_CODEX_ROOTS", ["$HOME/.codex/sessions"])
+ MAX_BYTES = _int_env("HERDR_TRANSCRIPT_MAX_BYTES", 64 * 1024 * 1024)
+ TAIL_BYTES = _int_env("HERDR_TRANSCRIPT_TAIL_BYTES", 8 * 1024 * 1024)
+ # Remote is stingier than local: the bytes cross a network, and the biggest transcript on this
+@@ -426,6 +441,107 @@ def parse_claude(lines):
+     return turns, title
+ 
+ 
++# ---------------------------------------------------------------------------- codex parser
++#
++# Codex rollouts carry both response_item and event_msg rows for the same conversation. Read
++# only the canonical response items: message text, function/custom tool calls and their results.
++# Session metadata, developer/system messages, reasoning and streaming events are not turns.
++
++
++def _codex_text(content):
++    if not isinstance(content, list):
++        return ""
++    return "\n".join(block["text"] for block in content
++                     if isinstance(block, dict) and block.get("type") in ("input_text", "output_text")
++                     and isinstance(block.get("text"), str) and block["text"].strip())
++
++
++def _codex_tool_result(payload, tool_turns):
++    call_id = payload.get("call_id")
++    if not isinstance(call_id, str) or call_id not in tool_turns:
++        return
++    output = payload.get("output")
++    if isinstance(output, str):
++        try:
++            decoded = json.loads(output)
++        except ValueError:
++            decoded = None
++        # Older shell tools wrap the output and exit code in a JSON string.
++        if isinstance(decoded, dict) and isinstance(decoded.get("output"), str):
++            output = decoded
++    failed = False
++    if isinstance(output, dict):
++        metadata = output.get("metadata")
++        exit_code = metadata.get("exit_code") if isinstance(metadata, dict) else None
++        failed = isinstance(exit_code, int) and exit_code != 0
++        output = output.get("output")
++    if isinstance(output, list):
++        output = _codex_text(output)
++    _fold_tool_result({"tool_use_id": call_id, "content": output, "is_error": failed}, tool_turns)
++
++
++def parse_codex(lines):
++    """(turns, title) from a Codex rollout JSONL, without duplicating its event stream."""
++    turns, tool_turns, seen_rows = [], {}, set()
++    for raw in lines:
++        raw = raw.strip()
++        if not raw:
++            continue
++        try:
++            row = json.loads(raw)
++        except ValueError:
++            continue  # a live rollout can end with a partially written row
++        if not isinstance(row, dict) or row.get("type") != "response_item":
++            continue
++        payload = row.get("payload")
++        if not isinstance(payload, dict):
++            continue
++        item_id = payload.get("id")
++        # Older rollouts have no item ids. Hash the row, not its index: a tail read or an append
++        # must not renumber existing pagination cursors. Replayed response items are deduped too.
++        key = item_id if isinstance(item_id, str) and item_id else hashlib.sha256(raw.encode()).hexdigest()
++        if key in seen_rows:
++            continue
++        seen_rows.add(key)
++        turn_row = {"uuid": key, "timestamp": row.get("timestamp")}
++        kind = payload.get("type")
++        if kind == "message":
++            role = payload.get("role")
++            if role not in ("user", "assistant") or payload.get("channel") == "analysis":
++                continue
++            text = _codex_text(payload.get("content"))
++            if text:
++                turns.append(_turn(turn_row, role, text, 0))
++        elif kind in ("function_call", "custom_tool_call"):
++            name = payload.get("name")
++            name = name if isinstance(name, str) and name else "tool"
++            args = _pi_tool_args(payload) if kind == "function_call" else {
++                "command": payload.get("input") if isinstance(payload.get("input"), str) else ""}
++            block = {"name": name, "input": args}
++            turn = _turn(turn_row, "tool", _tool_summary(block), 0, limit=TOOL_TEXT_LIMIT)
++            _annotate_tool(turn, block)
++            turns.append(turn)
++            call_id = payload.get("call_id")
++            if isinstance(call_id, str) and call_id:
++                tool_turns[call_id] = turn
++        elif kind in ("function_call_output", "custom_tool_call_output"):
++            _codex_tool_result(payload, tool_turns)
++    return turns, ""
++
++
++def locate_codex(session_value, roots=None):
++    """Find a dated (or older flat) rollout by validated session UUID, never by pane cwd."""
++    for root in (roots if roots is not None else CODEX_ROOTS):
++        root = os.path.realpath(os.path.expanduser(root))
++        for prefix in (os.path.join("*", "*", "*"), ""):
++            pattern = os.path.join(glob.escape(root), prefix, f"rollout-*-{session_value}.jsonl")
++            for path in sorted(glob.glob(pattern)):
++                real = os.path.realpath(path)
++                if os.path.commonpath([root, real]) == root and os.path.isfile(real):
++                    return real
++    return None
++
++
+ # ---------------------------------------------------------------------------- pi parser
+ #
+ # pi's JSONL is an event stream: one row per `type`, and a conversation turn is a
+@@ -542,14 +658,145 @@ def locate_pi(path_value, roots=None):
+ 
+     The value comes from herdr, not a client, but a containment check is cheap insurance against
+     a path ref ever pointing outside the sessions tree.
++
++    A ref can outlive its file: pi prunes old sessions while the pane keeps advertising them
++    (measured here -- one idle pane named a deleted file, its directory still holding four
++    others). Rather than answer no-log for a pane whose history is on disk, the newest sibling
++    in the same project directory stands in, and the chain walks older ones from there.
+     """
+     if not isinstance(path_value, str) or not path_value:
+         return None
+     real = os.path.realpath(path_value)
+     for root in (roots if roots is not None else PI_ROOTS):
+         root_real = os.path.realpath(os.path.expanduser(root))
+-        if real == root_real or real.startswith(root_real + os.sep):
+-            return real if os.path.isfile(real) else None
++        if real != root_real and not real.startswith(root_real + os.sep):
++            continue
++        if os.path.isfile(real):
++            return real
++        siblings = sorted(glob.glob(os.path.join(os.path.dirname(real), "*.jsonl")))
++        if siblings:
++            return siblings[-1]  # the name's timestamp prefix is the session's creation time
++        return None
++    return None
++
++
++# ---------------------------------------------------------------------------- kimi parser
++#
++# kimi-code's wire.jsonl is an event stream, and the same conversation arrives on three of its
++# channels: `agent.message.appended` carries each finished message (role user/assistant/tool),
++# `context.append_message` repeats the typed prompts and adds the machinery's injections, and
++# `context.append_loop_event` is the streaming trace the finished message supersedes. Only the
++# first is read, so nothing is counted twice. Message shapes measured across the 105 sessions on
++# this machine:
++#
++#   user       -> content is text blocks; meta.source "input" is a person typing, "notify" is the
++#                 background-task channel (a cron fire, a finished watcher) and reads as a note.
++#   assistant  -> content is `think` + `text` blocks (think dropped, same policy as the others);
++#                 toolCalls carry {id, name, arguments} with arguments a JSON string like pi's.
++#   tool       -> a tool RESULT, one message per call, linked by toolCallId; content is text and
++#                 image_url blocks, and the images are base64 in the row -- text only, ever.
++
++
++def _kimi_timestamp(row):
++    """kimi stamps rows in epoch milliseconds; every other harness and every client speaks ISO."""
++    try:
++        ms = int(row.get("time"))
++    except (TypeError, ValueError):
++        return ""
++    at = datetime.fromtimestamp(ms / 1000, timezone.utc)
++    return at.strftime("%Y-%m-%dT%H:%M:%S") + f".{ms % 1000:03d}Z"
++
++
++def _kimi_blocks(message):
++    blocks = message.get("content")
++    if isinstance(blocks, str):
++        return [{"type": "text", "text": blocks}]
++    return blocks if isinstance(blocks, list) else []
++
++
++def _kimi_spoken(blocks):
++    """The text blocks' texts joined, or "" -- think and image_url never contribute."""
++    pieces = [block.get("text") for block in blocks
++              if isinstance(block, dict) and block.get("type") == "text"
++              and isinstance(block.get("text"), str) and block.get("text").strip()]
++    return "\n".join(pieces)
++
++
++def parse_kimi(lines):
++    """(turns, title) from kimi-code's wire.jsonl. Oldest first, same turn shape as parse_claude."""
++    turns = []
++    tool_turns = {}
++    for raw in lines:
++        raw = raw.strip()
++        if not raw:
++            continue
++        try:
++            row = json.loads(raw)
++        except ValueError:
++            continue  # torn last line while the file is being appended to
++        if not isinstance(row, dict) or row.get("type") != "agent.message.appended":
++            continue
++        outer = row.get("message")
++        message = outer.get("message") if isinstance(outer, dict) else None
++        if not isinstance(message, dict):
++            continue
++        # _turn reads uuid and timestamp off the row; kimi rows carry neither, but they do carry
++        # epoch-ms `time`, which becomes the timestamp every client already renders.
++        row = {"timestamp": _kimi_timestamp(row)}
++        role = message.get("role")
++        blocks = _kimi_blocks(message)
++        if role == "user":
++            spoken = _kimi_spoken(blocks)
++            if not spoken:
++                continue
++            source = (outer.get("meta") or {}).get("source") if isinstance(outer, dict) else None
++            turns.append(_turn(row, "note" if source == "notify" else "user", spoken, 0))
++        elif role == "assistant":
++            for index, block in enumerate(blocks):
++                if not isinstance(block, dict) or block.get("type") != "text":
++                    continue
++                text = block.get("text")
++                if isinstance(text, str) and text.strip():
++                    turns.append(_turn(row, "assistant", text, index))
++            for call in message.get("toolCalls") or []:
++                if not isinstance(call, dict):
++                    continue
++                name = call.get("name")
++                name = name if isinstance(name, str) and name else "tool"
++                args = _pi_tool_args(call)  # kimi stores arguments as a JSON string too
++                detail = _tool_target(args)
++                summary = f"{name}({detail})" if detail else name
++                turn = _turn(row, "tool", summary, 0, limit=TOOL_TEXT_LIMIT)
++                _annotate_tool(turn, {"name": name, "input": args})
++                turns.append(turn)
++                call_id = call.get("id")
++                if isinstance(call_id, str) and call_id:
++                    tool_turns[call_id] = turn
++        elif role == "tool":
++            turn = tool_turns.get(message.get("toolCallId"))
++            head = _first_line(_kimi_spoken(blocks))
++            if turn is not None and head:
++                turn["text"], turn["truncated"] = clip(
++                    f"{turn['text']} \u2192 {head}", TOOL_TEXT_LIMIT)
++    for index, turn in enumerate(turns):
++        if not turn["uuid"] or turn["uuid"].startswith("#"):
++            turn["uuid"] = f"turn-{index}"
++    return turns, ""
++
++
++def locate_kimi(session_value, roots=None):
++    """The wire.jsonl for a `session_<uuid>` ref, or None.
++
++    A glob on the leaf name rather than a derived path: the workspace directory in the middle
++    (`wd_<slug>_<hash>`) is keyed to the cwd kimi started in, which the pane's shell may have
++    left, exactly like claude's project directory. The value is SESSION_ID_RE-validated before it
++    gets here, so the pattern cannot be steered out of a root.
++    """
++    for root in (roots if roots is not None else KIMI_ROOTS):
++        matches = sorted(glob.glob(
++            os.path.join(os.path.expanduser(root), "*", session_value, "agents", "main", "wire.jsonl")))
++        if matches:
++            return matches[0]
+     return None
+ 
+ 
+@@ -577,7 +824,7 @@ def locate_claude(session_value, roots=None):
+ REMOTE_ROOT_RE = re.compile(r"\A[A-Za-z0-9_./~$-]+\Z")
+ 
+ 
+-def remote_probe_script(session_value, roots, expected_size, tail_bytes):
++def remote_probe_script(session_value, roots, expected_size, tail_bytes, harness="claude"):
+     """A POSIX script that answers NOFILE / CACHED / SIZE+tail in one round trip.
+ 
+     Only `ls`, `wc`, `tail` and `head` -- no python on the far side. `wc -c < file` is read through
+@@ -590,7 +837,11 @@ def remote_probe_script(session_value, roots, expected_size, tail_bytes):
+     safe_roots = [root for root in roots if REMOTE_ROOT_RE.match(root)]
+     if not safe_roots:
+         raise ValueError("no usable remote transcript root")
+-    candidates = " ".join(f"{root}/*/{session_value}.jsonl" for root in safe_roots)
++    if harness not in {"claude", "codex"} or not UUID_RE.match(session_value):
++        raise ValueError("no usable remote transcript ref")
++    suffixes = (f"*/*/*/rollout-*-{session_value}.jsonl", f"rollout-*-{session_value}.jsonl") \
++        if harness == "codex" else (f"*/{session_value}.jsonl",)
++    candidates = " ".join(f"{root}/{suffix}" for root in safe_roots for suffix in suffixes)
+     shortcut = (
+         f'[ "$s" = "{int(expected_size)}" ] && {{ echo CACHED; exit 0; }}; '
+         if expected_size > 0 else ""
+@@ -729,9 +980,13 @@ def _unavailable(reason, agent=""):
+ 
+ 
+ # Each harness is (locate, parse). PATH_HARNESSES also names the session-ref kind it accepts:
+-# claude uses "id" (a uuid we glob for), pi uses "path" (an absolute file it hands over).
+-HARNESSES = {"claude": (locate_claude, parse_claude), "pi": (locate_pi, parse_pi)}
++# claude, codex and kimi use "id" (a value we glob for), pi uses "path" (an absolute file it hands over).
++HARNESSES = {"claude": (locate_claude, parse_claude), "codex": (locate_codex, parse_codex),
++             "pi": (locate_pi, parse_pi), "kimi": (locate_kimi, parse_kimi)}
+ PATH_HARNESSES = {"pi"}
++# The shape an "id" value must take, per harness. Anything absent defaults to a bare uuid, so an
++# unlisted harness keeps the tightest rule until somebody writes its reader.
++ID_VALUE_RES = {"kimi": SESSION_ID_RE}
+ 
+ 
+ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tools=False,
+@@ -748,9 +1003,9 @@ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tool
+     harness = session.get("agent") or agent
+     kind = session.get("kind")
+     value = session.get("value")
+-    # A path harness (pi) hands over an absolute file; an id harness (claude) hands over a uuid we
+-    # glob for. Validate the ref shape against what this harness actually uses -- a ref we cannot
+-    # make sense of is "no session", whatever the harness.
++    # A path harness (pi) hands over an absolute file; an id harness (claude, kimi) hands over a
++    # value we glob for. Validate the ref shape against what this harness actually uses -- a ref
++    # we cannot make sense of is "no session", whatever the harness.
+     if harness in PATH_HARNESSES:
+         if kind != "path" or not isinstance(value, str) or not value:
+             if log and session:
+@@ -761,7 +1016,9 @@ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tool
+             if log and session:
+                 log.info("transcript: session ref kind %r not supported", kind)
+             return _unavailable("no-session", agent)
+-        if not isinstance(value, str) or not UUID_RE.match(value):
++        # kimi's ids carry a `session_` prefix (see SESSION_ID_RE); every other id harness is a
++        # bare uuid. The pattern is what keeps the value safe to glue into a path.
++        if not isinstance(value, str) or not ID_VALUE_RES.get(harness, UUID_RE).match(value):
+             return _unavailable("no-session", agent)
+     entry = HARNESSES.get(harness)
+     if entry is None:
+@@ -771,6 +1028,9 @@ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tool
+             log.info("transcript: no reader for harness %r", harness)
+         return _unavailable("unsupported", harness)
+     locate, parse = entry
++    # Remote lookup needs a harness-specific path, not another harness's glob (or a raw path ref).
++    if remote and harness not in {"claude", "codex"}:
++        return _unavailable("unsupported", harness)
+ 
+     try:
+         limit = int(limit)
+@@ -778,10 +1038,15 @@ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tool
+         limit = DEFAULT_LIMIT
+     limit = max(1, min(limit or DEFAULT_LIMIT, MAX_LIMIT))
+     try:
++        chain = []
+         if remote:
+-            parsed = _load_remote(value, parse, remote, ssh_args, remote_runner)
++            parsed = _load_remote(value, parse, remote, ssh_args, remote_runner, harness=harness)
+         else:
+-            parsed = _load_local(value, locate, parse)
++            path = locate(value)
++            parsed = None if path is None else _read_parsed(path, parse)
++            # Codex's dated directory contains unrelated projects, not a pane's session chain.
++            if path is not None and harness != "codex":
++                chain = _older_sessions(harness, path)
+     except Exception:
+         if log:
+             log.exception("transcript read failed for session %s (remote=%s)", value, remote)
+@@ -789,8 +1054,29 @@ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tool
+     if parsed is None:
+         return _unavailable("no-log", agent)
+ 
++    # The current session first; older files join the walk only as the page needs them. Two
++    # needs, and either alone keeps the chain going: a page is not done while it bottoms out
++    # against everything parsed so far (it must be bounded by the limit or the byte budget
++    # instead, or the reader's next cursor would ask for the same page again -- measured as it
++    # shipped, a pane whose history fits one page ping-ponged the same two responses forever),
++    # and a cursor the parsed files cannot resolve must reach the file that holds it before
++    # paginate's newest-page fallback answers, or that fallback restarts the walk from the top.
+     turns, title, file_truncated = parsed
+     page, total, has_more = paginate(turns, limit, before, include_tools)
++    seen = _row_id_set(turns)
++    ordinal = 0
++    while chain and (not page or page[0] is _first_visible(turns, include_tools)
++                     or not _resolves(turns, before, include_tools)):
++        older_turns, _older_title, older_truncated = _read_parsed(chain.pop(0), parse)
++        ordinal += 1
++        older_turns = [turn for turn in _scoped(older_turns, ordinal) if turn["uuid"] not in seen]
++        seen |= _row_id_set(older_turns)
++        file_truncated = file_truncated or older_truncated
++        turns = older_turns + turns
++        page, total, has_more = paginate(turns, limit, before, include_tools)
++    if chain:
++        # The start of the parsed files is not the start of this pane's history.
++        has_more = True
+     return {
+         "messages": page,
+         "total": total,
+@@ -806,6 +1092,11 @@ def _load_local(value, locate, parse):
+     path = locate(value)
+     if not path:
+         return None
++    return _read_parsed(path, parse)
++
++
++def _read_parsed(path, parse):
++    """(turns, title, file_truncated) for one located transcript, through the cache."""
+     stat = os.stat(path)
+     key = (None, path)
+     fingerprint = (stat.st_size, stat.st_mtime_ns)
+@@ -819,11 +1110,100 @@ def _load_local(value, locate, parse):
+     return parsed
+ 
+ 
+-def _load_remote(value, parse, remote, ssh_args, remote_runner):
+-    """Only the script's path shape is claude-specific; the parse comes from the harness table."""
+-    key = (remote, value)
++# ---------------------------------------------------------------------------- session chain
++#
++# A pane's session ref names only its newest conversation, but "load older" should not stop at
++# that file's first turn: the same directory (claude, pi) or the same workspace directory (kimi)
++# holds the pane's earlier sessions. They are chained oldest-first in front of the current one,
++# parsed only as a page needs them -- one file while a walk stays inside the newest session, more
++# as the reader pages back, and never more than a page's worth of turns costs a parse. Local
++# only: a remote pane would pay an SSH round trip per chained file, and no remote host on this
++# relay runs an agent worth paging through.
++#
++# Two rules keep cursors working across files:
++#   - a turn whose uuid is a row id (claude's and pi's rows carry one) keeps it, and a chained
++#     file replaying rows a newer file already holds -- a resumed session re-appending what it
++#     loaded, measured in one pi project and claude both -- is dropped by that id;
++#   - a turn whose uuid is the parser's positional fallback ("turn-N": every kimi turn, and the
++#     rows pi or claude never stamped) names a different turn in every file, so it is scoped with
++#     its file's chain ordinal.
++
++POSITIONAL_UUID_RE = re.compile(r"\Aturn-\d+\Z")
++
++
++def _first_visible(turns, include_tools):
++    for turn in turns:
++        if include_tools or turn["role"] != "tool":
++            return turn
++    return None
++
++
++def _resolves(turns, before, include_tools):
++    """Whether `before` names a turn in the parsed set, on the same tool filter paginate uses."""
++    if not before:
++        return True
++    for turn in turns:
++        if turn["uuid"] == before and (include_tools or turn["role"] != "tool"):
++            return True
++    return False
++
++
++def _row_id_set(turns):
++    """The uuids that genuinely identify a row, positional fallbacks excluded."""
++    return {turn["uuid"] for turn in turns if not POSITIONAL_UUID_RE.match(turn["uuid"])}
++
++
++def _scoped(turns, ordinal):
++    """A private copy of a chained file's turns, its positional uuids scoped to that file.
++
++    Copied, not mutated: the turns list is the cache's, and a second walk through the same chain
++    must find the same uuids it handed out as cursors the first time.
++    """
++    fresh = [dict(turn) for turn in turns]
++    prefix = f"t{ordinal}."
++    for turn in fresh:
++        if POSITIONAL_UUID_RE.match(turn["uuid"]):
++            turn["uuid"] = prefix + turn["uuid"]
++    return fresh
++
++
++def _mtime(path):
++    try:
++        return os.path.getmtime(path)
++    except OSError:
++        return 0.0
++
++
++def _older_sessions(harness, path):
++    """The pane's earlier session files, newest first, or [].
++
++    Order and membership differ by harness because what a filename can promise differs:
++      pi     -- the file's timestamp prefix is the session's creation time, so name order is
++                creation order and nothing created later (another pane's session) can chain;
++      claude -- the filename is a bare session uuid, so mtime is the only order and only files
++                last written before the current one chain;
++      kimi   -- sessions are directories, so the same mtime rule applies to each one's wire.jsonl.
++    """
++    if harness == "kimi":
++        # wire.jsonl -> main -> agents -> session_<uuid> -> the workspace directory.
++        directory = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path))))
++        candidates = glob.glob(os.path.join(directory, "session_*", "agents", "main", "wire.jsonl"))
++    else:
++        directory = os.path.dirname(path)
++        candidates = glob.glob(os.path.join(directory, "*.jsonl"))
++    if harness == "pi":
++        name = os.path.basename(path)
++        return sorted((c for c in candidates if os.path.basename(c) < name), reverse=True)
++    mine = _mtime(path)
++    return sorted((c for c in candidates if _mtime(c) < mine), key=_mtime, reverse=True)
++
++
++def _load_remote(value, parse, remote, ssh_args, remote_runner, harness="claude"):
++    """Read the harness's own path shape, keeping its remote parse cache separate too."""
++    key = (remote, harness, value)
++    roots = REMOTE_CODEX_ROOTS if harness == "codex" else REMOTE_ROOTS
+     runner = remote_runner or _default_remote_runner
+-    script = remote_probe_script(value, REMOTE_ROOTS, cache_peek_size(key), REMOTE_TAIL_BYTES)
++    script = remote_probe_script(value, roots, cache_peek_size(key), REMOTE_TAIL_BYTES, harness=harness)
+     returncode, blob = runner(remote, script, ssh_args)
+     if returncode != 0:
+         raise OSError(f"ssh transcript read failed on {remote} with exit {returncode}")
+@@ -836,7 +1216,7 @@ def _load_remote(value, parse, remote, ssh_args, remote_runner):
+         if cached is not None:
+             return cached
+         # The cache was evicted between the probe and now. Ask again without the shortcut.
+-        script = remote_probe_script(value, REMOTE_ROOTS, 0, REMOTE_TAIL_BYTES)
++        script = remote_probe_script(value, roots, 0, REMOTE_TAIL_BYTES, harness=harness)
+         returncode, blob = runner(remote, script, ssh_args)
+         if returncode != 0:
+             raise OSError(f"ssh transcript read failed on {remote} with exit {returncode}")
+diff --git a/tests/run.sh b/tests/run.sh
+index 4076a7b..a2491fe 100755
+--- a/tests/run.sh
++++ b/tests/run.sh
+@@ -95,6 +95,7 @@ assert_eq "$?" "0" "no duplicate function declarations"
+ echo "9c2. every script the page loads exists"
+ MISSING=""
+ for src in $(grep -oE '<script src="[^"]+"' "$WEB" | sed -e 's/.*src="//' -e 's/"//'); do
++  src=${src%%[?#]*}
+   [ -f "$DIR/web/$src" ] || MISSING="$MISSING $src"
+ done
+ [ -z "$MISSING" ]
+diff --git a/tests/test_herdr_relay.py b/tests/test_herdr_relay.py
+index b270cdf..948d382 100644
+--- a/tests/test_herdr_relay.py
++++ b/tests/test_herdr_relay.py
+@@ -36,11 +36,32 @@ def _websockets_stubs():
+     exceptions = types.ModuleType("websockets.exceptions")
+     exceptions.ConnectionClosedError = _ConnectionClosed
+     exceptions.ConnectionClosedOK = _ConnectionClosed
++    # process_request builds its HTTP replies with these; a stub keeps the auth tests independent
++    # of the installed websockets version's (ever-moving) http11 internals.
++    http11 = types.ModuleType("websockets.http11")
++
++    class _Response:
++        def __init__(self, status, reason, headers, body):
++            self.status, self.reason, self.headers, self.body = status, reason, headers, body
++
++    http11.Response = _Response
++    datastructures = types.ModuleType("websockets.datastructures")
++
++    class _Headers:
++        def __init__(self, raw=None):
++            self._items = list(raw or [])
++
++        def raw_items(self):
++            return list(self._items)
++
++    datastructures.Headers = _Headers
+     return {
+         "websockets": websockets,
+         "websockets.asyncio": websockets_asyncio,
+         "websockets.asyncio.server": websockets_server,
+         "websockets.exceptions": exceptions,
++        "websockets.http11": http11,
++        "websockets.datastructures": datastructures,
+     }
+ 
+ 
+diff --git a/tests/test_relay_auth.py b/tests/test_relay_auth.py
+new file mode 100644
+index 0000000..6ebd940
+--- /dev/null
++++ b/tests/test_relay_auth.py
+@@ -0,0 +1,219 @@
++"""How a browser gets from ?token= to a session cookie -- and what must not change for the rest.
++
++OWASP is blunt about URL tokens: they land in browser history, proxy logs, Referer headers and
++bookmarks. The relay's answer is the bootstrap hop -- the one browser load that carries ?token=
++is exchanged for a `__Host-` session cookie and the bare URL (via location.replace, so the
++tokened entry is replaced rather than left behind) before the app renders at all. Everything
++that is not a browser navigation -- curl, the native clients, the WebSocket handshake, the
++event push -- keeps the `?token=` semantics it already had.
++"""
++import asyncio
++import unittest
++
++from test_herdr_relay import loaded_relay
++
++TOKEN = "secret-token"
++
++
++class _Headers:
++    def __init__(self, items):
++        self._items = list(items)
++
++    def raw_items(self):
++        return list(self._items)
++
++
++class _Request:
++    def __init__(self, path="/", headers=(), method="GET"):
++        self.path = path
++        self.method = method
++        self.headers = _Headers(headers)
++
++
++def request(relay, path, headers=(), method="GET"):
++    return asyncio.run(relay.process_request(None, _Request(path, headers, method)))
++
++
++def set_cookie(response, name):
++    """The full Set-Cookie line for one cookie name, or None."""
++    for key, value in response.headers.raw_items():
++        if key.lower() == "set-cookie" and value.split("=", 1)[0] == name:
++            return value
++    return None
++
++
++def cookie_value(response, name):
++    header = set_cookie(response, name)
++    return header.split(";", 1)[0].split("=", 1)[1] if header else None
++
++
++BROWSER = [("Accept", "text/html")]
++
++
++class BootstrapHopTests(unittest.TestCase):
++    def test_a_browser_load_with_token_gets_the_exchange_page(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, f"/?token={TOKEN}", BROWSER)
++            self.assertEqual(resp.status, 200)
++            self.assertIn(b"location.replace(location.pathname", resp.body)
++
++    def test_the_token_is_never_rendered_into_the_page(self):
++        """The script reads it off location.search; the HTML itself must stay static and clean."""
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, f"/?token={TOKEN}", BROWSER)
++            self.assertNotIn(TOKEN.encode(), resp.body)
++
++    def test_the_exchange_plants_a_session_cookie_that_is_not_the_token(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, f"/?token={TOKEN}", BROWSER)
++            sid = cookie_value(resp, relay.AUTH_SESSION_COOKIE)
++            self.assertTrue(sid)
++            self.assertNotEqual(sid, TOKEN)
++            self.assertNotIn(TOKEN, set_cookie(resp, relay.AUTH_SESSION_COOKIE))
++
++    def test_the_session_cookie_is_hardened(self):
++        """__Host- prefix + Secure + HttpOnly + SameSite=Lax + Path=/, no Domain -- host-pinned."""
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, f"/?token={TOKEN}", BROWSER)
++            header = set_cookie(resp, relay.AUTH_SESSION_COOKIE)
++            self.assertTrue(relay.AUTH_SESSION_COOKIE.startswith("__Host-"))
++            for attribute in ("Secure", "HttpOnly", "SameSite=Lax", "Path=/"):
++                self.assertIn(attribute, header)
++            self.assertNotIn("Domain", header)
++
++    def test_the_exchange_page_is_never_cached(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, f"/?token={TOKEN}", BROWSER)
++            cache = [v for k, v in resp.headers.raw_items() if k.lower() == "cache-control"]
++            self.assertIn("no-store", cache)
++
++    def test_deep_link_parameters_survive_the_exchange(self):
++        """A push opens /?pane=...&token=... -- pane must land, token must not."""
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, f"/?pane=w1p2&token={TOKEN}", BROWSER)
++            self.assertIn(b"params.delete('token')", resp.body)
++            self.assertIn(b"location.pathname + (q ? '?' + q : '')", resp.body)
++
++
++class SessionCookieTests(unittest.TestCase):
++    def test_the_session_cookie_authenticates_the_real_app(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            boot = request(relay, f"/?token={TOKEN}", BROWSER)
++            sid = cookie_value(boot, relay.AUTH_SESSION_COOKIE)
++            resp = request(relay, "/", BROWSER + [("Cookie", f"{relay.AUTH_SESSION_COOKIE}={sid}")])
++            self.assertEqual(resp.status, 200)
++            self.assertNotIn(b"location.replace(location.pathname", resp.body)  # the app itself
++
++    def test_the_raw_token_cookie_is_never_issued_again(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            boot = request(relay, f"/?token={TOKEN}", BROWSER)
++            sid = cookie_value(boot, relay.AUTH_SESSION_COOKIE)
++            resp = request(relay, "/", BROWSER + [("Cookie", f"{relay.AUTH_SESSION_COOKIE}={sid}")])
++            self.assertIsNone(set_cookie(resp, "herdr_token"))
++
++    def test_an_unknown_session_cookie_is_rejected(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, "/", BROWSER + [("Cookie", f"{relay.AUTH_SESSION_COOKIE}=made-up")])
++            self.assertEqual(resp.status, 401)
++
++    def test_the_legacy_raw_token_cookie_still_works_and_is_upgraded(self):
++        """An already-logged-in phone must not be bounced by the upgrade."""
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, "/", BROWSER + [("Cookie", f"herdr_token={TOKEN}")])
++            self.assertEqual(resp.status, 200)
++            self.assertTrue(cookie_value(resp, relay.AUTH_SESSION_COOKIE))
++
++    def test_a_session_survives_a_restart(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            boot = request(relay, f"/?token={TOKEN}", BROWSER)
++            sid = cookie_value(boot, relay.AUTH_SESSION_COOKIE)
++            relay._save_auth_sessions()
++            relay.auth_sessions = {}
++            relay._load_auth_sessions()
++            self.assertIn(sid, relay.auth_sessions)
++
++    def test_token_rotation_retires_issued_sessions(self):
++        """Rotating HERDR_RELAY_TOKEN must not leave old sessions standing."""
++        with loaded_relay(relay_token=TOKEN) as relay:
++            boot = request(relay, f"/?token={TOKEN}", BROWSER)
++            sid = cookie_value(boot, relay.AUTH_SESSION_COOKIE)
++            relay.AUTH_TOKEN = "rotated-secret"
++            relay._load_auth_sessions()
++            self.assertNotIn(sid, relay.auth_sessions)
++            resp = request(relay, "/", BROWSER + [("Cookie", f"{relay.AUTH_SESSION_COOKIE}={sid}")])
++            self.assertEqual(resp.status, 401)
++
++    def test_a_corrupt_sessions_file_costs_sessions_not_startup(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            with open(relay.AUTH_SESSIONS_FILE, "w") as f:
++                f.write("{not json")
++            relay._load_auth_sessions()
++            self.assertEqual(relay.auth_sessions, {})
++
++    def test_an_old_token_fingerprint_in_the_file_is_dropped_on_load(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            with open(relay.AUTH_SESSIONS_FILE, "w") as f:
++                f.write('{"stale-id": "not-this-token", "fresh-id": "%s"}'
++                        % relay._token_fingerprint())
++            relay._load_auth_sessions()
++            self.assertEqual(list(relay.auth_sessions), ["fresh-id"])
++
++
++class UnchangedFlowsTests(unittest.TestCase):
++    def test_bearer_auth_still_works(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, "/", [("Authorization", f"Bearer {TOKEN}"), ("Accept", "*/*")])
++            self.assertEqual(resp.status, 200)
++            self.assertNotIn(b"location.replace(location.pathname", resp.body)
++
++    def test_a_wrong_token_is_rejected_and_gets_no_session(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, "/?token=wrong-token", BROWSER)
++            self.assertEqual(resp.status, 401)
++            self.assertIsNone(set_cookie(resp, relay.AUTH_SESSION_COOKIE))
++
++    def test_bare_requests_are_still_rejected(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            self.assertEqual(request(relay, "/", BROWSER).status, 401)
++
++    def test_a_non_browser_load_with_query_token_is_not_hijacked(self):
++        """curl and scripts fetch /?token= as data, not as a navigation -- serve it straight."""
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, f"/?token={TOKEN}", [("Accept", "*/*")])
++            self.assertEqual(resp.status, 200)
++            self.assertNotIn(b"location.replace(location.pathname", resp.body)
++
++    def test_the_websocket_handshake_keeps_query_token_semantics(self):
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(relay, f"/?token={TOKEN}", [
++                ("Accept", "*/*"), ("Upgrade", "websocket"), ("Connection", "Upgrade"),
++            ])
++            self.assertIsNone(resp)  # None = proceed with the handshake
++
++    def test_the_websocket_handshake_accepts_the_session_cookie(self):
++        """Same-origin WS connects bare -- the cookie rides the handshake, no token in any URL."""
++        with loaded_relay(relay_token=TOKEN) as relay:
++            boot = request(relay, f"/?token={TOKEN}", BROWSER)
++            sid = cookie_value(boot, relay.AUTH_SESSION_COOKIE)
++            resp = request(relay, "/", [
++                ("Accept", "*/*"), ("Upgrade", "websocket"), ("Connection", "Upgrade"),
++                ("Cookie", f"{relay.AUTH_SESSION_COOKIE}={sid}"),
++            ])
++            self.assertIsNone(resp)
++
++    def test_event_push_with_a_query_token_still_enqueues(self):
++        """The plugin pushes ?d=<json> on any path -- order is load-bearing, this must not move."""
++        with loaded_relay(relay_token=TOKEN) as relay:
++            resp = request(
++                relay,
++                "/?d=%7B%22type%22%3A%22probe%22%7D&token=" + TOKEN,
++                [("Accept", "*/*")],
++                method="POST",
++            )
++            self.assertEqual(resp.status, 200)
++            self.assertEqual(resp.body, b"ok\n")
++            self.assertEqual(relay.event_queue.get_nowait().get("type"), "probe")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_transcript.py b/tests/test_transcript.py
+index 280495b..37571d7 100644
+--- a/tests/test_transcript.py
++++ b/tests/test_transcript.py
+@@ -709,5 +709,361 @@ class PiTests(unittest.TestCase):
+         self.assertEqual(body["unavailable"], "no-session")
+ 
+ 
++KIMI_SESSION = f"session_{SESSION}"
++KIMI_TIME = 1791219687380  # epoch ms, the shape every kimi row is stamped with
++
++
++def kimi_appended(role, content, source="input", calls=(), tool_call_id=None, time=KIMI_TIME):
++    """One `agent.message.appended` row, the only kimi channel that carries finished messages."""
++    message = {"role": role, "content": content}
++    if calls:
++        message["toolCalls"] = calls
++    if tool_call_id:
++        message["toolCallId"] = tool_call_id
++    return {"type": "agent.message.appended", "time": time,
++            "message": {"message": message, "meta": {"source": source}}}
++
++
++def write_kimi_wire(root, rows, session=KIMI_SESSION, workspace="wd_project_ab12cd34ef56"):
++    directory = Path(root) / workspace / session / "agents" / "main"
++    directory.mkdir(parents=True, exist_ok=True)
++    path = directory / "wire.jsonl"
++    with open(path, "w", encoding="utf-8") as handle:
++        for item in rows:
++            handle.write(json.dumps(item) + "\n")
++    return path
++
++
++class KimiTests(unittest.TestCase):
++    """kimi hands over a `session_<uuid>` leaf (kind 'id'); wire.jsonl is an event stream whose
++    finished messages all arrive on `agent.message.appended`."""
++
++    def parse_kimi(self, rows):
++        return transcript.parse_kimi(json.dumps(r) for r in rows)
++
++    def test_user_and_assistant_text_become_turns(self):
++        turns, _ = self.parse_kimi([
++            kimi_appended("user", [{"type": "text", "text": "do the thing"}]),
++            kimi_appended("assistant", [{"type": "text", "text": "done"}], source="llm"),
++        ])
++        self.assertEqual([(t["role"], t["text"]) for t in turns],
++                         [("user", "do the thing"), ("assistant", "done")])
++        # Epoch milliseconds become the ISO string every client already renders.
++        self.assertEqual(turns[0]["ts"], "2026-10-05T17:01:27.380Z")
++
++    def test_thinking_blocks_are_dropped(self):
++        turns, _ = self.parse_kimi([
++            kimi_appended("assistant", [
++                {"type": "think", "think": "secret plan"},
++                {"type": "text", "text": "visible"},
++            ], source="llm"),
++        ])
++        self.assertEqual([t["text"] for t in turns], ["visible"])
++
++    def test_notify_is_a_note_not_the_person_talking(self):
++        turns, _ = self.parse_kimi([
++            kimi_appended("user", [{"type": "text", "text": "background task finished"}],
++                          source="notify"),
++        ])
++        self.assertEqual(turns[0]["role"], "note")
++
++    def test_tool_calls_come_from_a_json_string_and_carry_a_diff(self):
++        turns, _ = self.parse_kimi([
++            kimi_appended("assistant", [], source="llm", calls=[
++                {"type": "function", "id": "call_1", "name": "Edit", "arguments": json.dumps({
++                    "file_path": "/repo/f",
++                    "old_string": "one\n", "new_string": "uno\n"})},
++            ]),
++        ])
++        tool = turns[0]
++        self.assertEqual((tool["role"], tool["tool"], tool["target"]),
++                         ("tool", "Edit", "/repo/f"))
++        self.assertEqual(tool["diff"].splitlines(), ["-one", "+uno"])
++
++    def test_a_tool_result_folds_onto_its_call_by_toolcallid(self):
++        turns, _ = self.parse_kimi([
++            kimi_appended("assistant", [], source="llm", calls=[
++                {"type": "function", "id": "call_1", "name": "Bash",
++                 "arguments": json.dumps({"command": "echo hi"})},
++            ]),
++            kimi_appended("tool", [
++                {"type": "text", "text": "<image path=\"/tmp/a.png\">"},
++                {"type": "image_url", "imageUrl": {"url": "data:image/png;base64,AAAA"}},
++                {"type": "text", "text": "</image>"},
++            ], source="tool", tool_call_id="call_1"),
++        ])
++        self.assertEqual(len(turns), 1)
++        self.assertIn("\u2192 <image path=\"/tmp/a.png\">", turns[0]["text"])
++        # The base64 image never reaches a turn, whichever block carried it.
++        self.assertNotIn("base64", turns[0]["text"])
++
++    def test_the_other_two_channels_are_not_read_so_nothing_is_counted_twice(self):
++        """The typed prompt also arrives on `context.append_message`, and the machinery's
++        injections arrive there too; the loop events are the streaming trace."""
++        rows = [
++            {"type": "context.append_message", "agentId": "main", "time": KIMI_TIME,
++             "message": {"role": "user", "content": [{"type": "text", "text": "do the thing"}],
++                         "origin": {"kind": "user"}}},
++            {"type": "context.append_message", "agentId": "main", "time": KIMI_TIME,
++             "message": {"role": "user", "content": [{"type": "text", "text": "<system-reminder>"}],
++                         "origin": {"kind": "injection"}}},
++            {"type": "context.append_loop_event", "agentId": "main", "time": KIMI_TIME,
++             "event": {"type": "content.part", "text": "streamed"}},
++            kimi_appended("user", [{"type": "text", "text": "do the thing"}]),
++        ]
++        turns, _ = self.parse_kimi(rows)
++        self.assertEqual([(t["role"], t["text"]) for t in turns], [("user", "do the thing")])
++
++    def test_turn_ids_are_unique_without_a_row_uuid(self):
++        """kimi rows carry no message id, so ids fall back to turn-N -- pagination cursors still
++        need every one of them distinct."""
++        turns, _ = self.parse_kimi([
++            kimi_appended("user", [{"type": "text", "text": "ask"}]),
++            kimi_appended("assistant", [{"type": "text", "text": "answer"}], source="llm"),
++            kimi_appended("assistant", [{"type": "text", "text": "and more"}], source="llm"),
++        ])
++        self.assertEqual(len({t["uuid"] for t in turns}), 3)
++
++    def test_a_torn_last_line_is_skipped_not_raised(self):
++        lines = [json.dumps(kimi_appended("user", [{"type": "text", "text": "intact"}])),
++                 json.dumps(kimi_appended("user", [{"type": "text", "text": "torn"}]))[:40]]
++        turns, _ = transcript.parse_kimi(lines)
++        self.assertEqual([t["text"] for t in turns], ["intact"])
++
++    def test_a_kimi_id_needs_its_prefix_and_a_uuid(self):
++        rejected = [SESSION, "../" + KIMI_SESSION, KIMI_SESSION.upper() + "/x",
++                    "session_" + SESSION[:-2], ""]
++        for value in rejected:
++            with self.subTest(value=value):
++                self.assertIsNone(transcript.SESSION_ID_RE.match(value))
++                body = transcript.history({"agent": "kimi", "kind": "id", "value": value},
++                                          agent="kimi")
++                self.assertEqual(body["unavailable"], "no-session")
++        # And the prefix is kimi's, not a general relaxation: claude still wants a bare uuid.
++        body = transcript.history({"agent": "claude", "kind": "id", "value": KIMI_SESSION},
++                                  agent="claude")
++        self.assertEqual(body["unavailable"], "no-session")
++
++    def test_history_reads_the_wire_under_a_kimi_root(self):
++        with tempfile.TemporaryDirectory() as root:
++            write_kimi_wire(root, [kimi_appended("user", [{"type": "text", "text": "hello"}])])
++            mod = load_transcript({"HERDR_KIMI_ROOTS": root})
++            body = mod.history({"agent": "kimi", "kind": "id", "value": KIMI_SESSION}, agent="kimi")
++        self.assertIsNone(body["unavailable"])
++        self.assertEqual(body["messages"][0]["text"], "hello")
++        self.assertEqual(body["agent"], "kimi")
++
++    def test_a_session_directory_that_is_not_there_yet_is_no_log(self):
++        with tempfile.TemporaryDirectory() as root:
++            mod = load_transcript({"HERDR_KIMI_ROOTS": root})
++            body = mod.history({"agent": "kimi", "kind": "id", "value": KIMI_SESSION}, agent="kimi")
++        self.assertEqual(body["unavailable"], "no-log")
++
++
++def write_pi_session(root, rows, name):
++    path = Path(root) / name
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with open(path, "w", encoding="utf-8") as handle:
++        for item in rows:
++            handle.write(json.dumps(item) + "\n")
++    return path
++
++
++class SessionChainTests(unittest.TestCase):
++    """A pane's ref names its newest session; `load older` walks into the earlier files beside it."""
++
++    def setUp(self):
++        transcript.cache_clear()
++        self.addCleanup(transcript.cache_clear)
++
++    def pi_body(self, root, name, **extra):
++        # A fresh module per call, its pi roots pointed at this test's directory: locate_pi is a
++        # containment check, and a temp dir is not inside ~/.pi by definition.
++        mod = load_transcript({"HERDR_PI_ROOTS": root})
++        return mod.history({"agent": "pi", "kind": "path", "value": str(Path(root) / name)},
++                           agent="pi", **extra)
++
++    def test_pi_pages_from_the_newest_session_into_the_older_one(self):
++        with tempfile.TemporaryDirectory() as root:
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": "old question"}], mid="old1"),
++                pi_message("assistant", [{"type": "text", "text": "old answer"}], mid="old2"),
++            ], "2026-10-04T00-00-00-000Z_old.jsonl")
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": "new question"}], mid="new1"),
++            ], "2026-10-05T00-00-00-000Z_new.jsonl")
++            # Small enough to fit one page: the whole pane history arrives together, oldest
++            # first, with nothing left to load.
++            whole = self.pi_body(root, "2026-10-05T00-00-00-000Z_new.jsonl")
++            self.assertEqual([m["text"] for m in whole["messages"]],
++                             ["old question", "old answer", "new question"])
++            self.assertFalse(whole["has_more"])
++            # Paged (the client asks for 200; a boundary needs a walk smaller than that to show),
++            # the cursor crosses the file boundary without repeating a page.
++            first = self.pi_body(root, "2026-10-05T00-00-00-000Z_new.jsonl", limit=2)
++            self.assertEqual([m["text"] for m in first["messages"]], ["old answer", "new question"])
++            self.assertTrue(first["has_more"])
++            second = self.pi_body(root, "2026-10-05T00-00-00-000Z_new.jsonl", limit=2,
++                                  before=first["messages"][0]["uuid"])
++            self.assertEqual([m["text"] for m in second["messages"]], ["old question"])
++            self.assertFalse(second["has_more"])  # now genuinely the start
++
++    def test_a_fresh_session_serves_the_previous_conversation(self):
++        """A pane one message into a new conversation should not show an empty panel."""
++        with tempfile.TemporaryDirectory() as root:
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": "what was said before"}], mid="o1"),
++            ], "2026-10-04T00-00-00-000Z_old.jsonl")
++            write_pi_session(root, [], "2026-10-05T00-00-00-000Z_new.jsonl")
++            body = self.pi_body(root, "2026-10-05T00-00-00-000Z_new.jsonl")
++        self.assertEqual([m["text"] for m in body["messages"]], ["what was said before"])
++        self.assertFalse(body["has_more"])
++
++    def test_rows_a_newer_session_replayed_are_not_served_twice(self):
++        """A resumed pi session re-appends what it loaded, ids and all (measured: one project
++        here shares 185 row ids across two files). The chained copy is dropped by id."""
++        with tempfile.TemporaryDirectory() as root:
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": "said once"}], mid="same"),
++            ], "2026-10-04T00-00-00-000Z_old.jsonl")
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": "said once"}], mid="same"),
++                pi_message("user", [{"type": "text", "text": "and then some"}], mid="later"),
++            ], "2026-10-05T00-00-00-000Z_new.jsonl")
++            body = self.pi_body(root, "2026-10-05T00-00-00-000Z_new.jsonl", before="same")
++        self.assertEqual([m["text"] for m in body["messages"]], [])
++        self.assertFalse(body["has_more"])
++
++    def test_kimi_chains_by_mtime_and_keeps_cursors_unique(self):
++        with tempfile.TemporaryDirectory() as root:
++            older = write_kimi_wire(root, [
++                kimi_appended("user", [{"type": "text", "text": "older session"}]),
++            ], session="session_00000000-0000-4000-8000-000000000001")
++            newer = write_kimi_wire(root, [
++                kimi_appended("user", [{"type": "text", "text": "newer session"}]),
++            ], session="session_00000000-0000-4000-8000-000000000002")
++            os.utime(older, (1_000_000_000, 1_000_000_000))
++            os.utime(newer, (2_000_000_000, 2_000_000_000))
++            mod = load_transcript({"HERDR_KIMI_ROOTS": root})
++            ref = {"agent": "kimi", "kind": "id",
++                   "value": "session_00000000-0000-4000-8000-000000000002"}
++            first = mod.history(ref, agent="kimi", limit=1)
++            self.assertEqual([m["text"] for m in first["messages"]], ["newer session"])
++            self.assertTrue(first["has_more"])
++            second = mod.history(ref, agent="kimi", limit=1, before=first["messages"][0]["uuid"])
++            self.assertEqual([m["text"] for m in second["messages"]], ["older session"])
++            # Both files' turns fall back to "turn-0"; the chain must not hand out the same
++            # cursor twice, or a page walk would resolve against the wrong file.
++            self.assertNotEqual(first["messages"][0]["uuid"], second["messages"][0]["uuid"])
++            self.assertFalse(second["has_more"])
++
++    def test_claude_does_not_chain_into_a_session_newer_than_the_current(self):
++        with tempfile.TemporaryDirectory() as root:
++            current = write_transcript(root, [user_row("mine", uuid="me1")], session=SESSION)
++            other = write_transcript(root, [user_row("another pane's live session", uuid="op1")],
++                                     session="9d3f2b7c-1111-4a5b-8c9d-000000000001")
++            os.utime(current, (1_000_000_000, 1_000_000_000))
++            os.utime(other, (2_000_000_000, 2_000_000_000))
++            with mock.patch.object(transcript, "LOCAL_ROOTS", [root]):
++                body = transcript.history({"kind": "id", "value": SESSION}, agent="claude")
++        self.assertFalse(body["has_more"])
++        self.assertEqual([m["text"] for m in body["messages"]], ["mine"])
++
++    def test_the_title_stays_the_current_sessions(self):
++        with tempfile.TemporaryDirectory() as root:
++            write_pi_session(root, [], "2026-10-04T00-00-00-000Z_old.jsonl")
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": "newest"}], mid="n1"),
++            ], "2026-10-05T00-00-00-000Z_new.jsonl")
++            first = self.pi_body(root, "2026-10-05T00-00-00-000Z_new.jsonl")
++            older = self.pi_body(root, "2026-10-05T00-00-00-000Z_new.jsonl",
++                                 before=first["messages"][0]["uuid"])
++        self.assertEqual(older["title"], first["title"])
++
++    def test_a_walk_across_three_sessions_terminates_without_repeating(self):
++        """The shape that spun as it shipped: sessions smaller than a page, a cursor that lands
++        in an older one, and a paginate whose newest-page fallback restarts the walk. Every
++        cursor must move strictly down and the walk must reach a last page."""
++        with tempfile.TemporaryDirectory() as root:
++            for day, (name, count) in enumerate((("old", 3), ("middle", 3), ("new", 3)), start=1):
++                write_pi_session(root, [
++                    pi_message("user", [{"type": "text", "text": f"{name} {i}"}], mid=f"{name}{i}")
++                    for i in range(count)
++                ], f"2026-10-0{day}T00-00-00-000Z_{name}.jsonl")
++            ref = {"agent": "pi", "kind": "path",
++                   "value": str(Path(root) / "2026-10-03T00-00-00-000Z_new.jsonl")}
++            walk = load_transcript({"HERDR_PI_ROOTS": root}).history
++            seen, texts, cursor, pages = set(), [], None, 0
++            for _ in range(20):  # a ping-pong runs out of retries rather than hanging the run
++                body = walk(ref, agent="pi", limit=4, **({"before": cursor} if cursor else {}))
++                self.assertIsNone(body["unavailable"])
++                if not body["messages"]:
++                    break
++                fresh = [m["uuid"] for m in body["messages"] if m["uuid"] not in seen]
++                self.assertTrue(fresh)  # a repeated page is the ping-pong again
++                seen.update(m["uuid"] for m in body["messages"])
++                texts.extend(m["text"] for m in body["messages"])
++                pages += 1
++                if not body["has_more"]:
++                    break
++                cursor = body["messages"][0]["uuid"]
++            else:
++                self.fail("the walk never reached a last page")
++            self.assertEqual(pages, 3)
++            # Walk order is newest page first; what matters is that every turn arrived exactly
++            # once and the walk reached into the oldest session.
++            self.assertEqual(sorted(texts), sorted(f"{name} {i}" for name in ("old", "middle", "new")
++                                                   for i in range(3)))
++            self.assertIn("old 0", texts)
++
++    def test_a_ref_that_outlives_its_file_falls_back_to_the_newest_sibling(self):
++        """pi prunes old session files while the pane keeps advertising them; the pane's history
++        is still on disk and the newest sibling stands in for the deleted file."""
++        with tempfile.TemporaryDirectory() as root:
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": "older days"}], mid="o1"),
++            ], "2026-10-04T00-00-00-000Z_a.jsonl")
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": "newest left standing"}], mid="n1"),
++            ], "2026-10-05T00-00-00-000Z_b.jsonl")
++            mod = load_transcript({"HERDR_PI_ROOTS": root})
++            body = mod.history({"agent": "pi", "kind": "path",
++                                "value": str(Path(root) / "2026-10-03T00-00-00-000Z_gone.jsonl")},
++                               agent="pi")
++        self.assertIsNone(body["unavailable"])
++        self.assertEqual([m["text"] for m in body["messages"]],
++                         ["older days", "newest left standing"])
++        self.assertFalse(body["has_more"])
++
++    def test_a_ref_to_a_deleted_file_in_an_empty_directory_is_still_no_log(self):
++        with tempfile.TemporaryDirectory() as root:
++            # The directory stands (it is the ref's own project directory); only the file is gone.
++            mod = load_transcript({"HERDR_PI_ROOTS": root})
++            body = mod.history({"agent": "pi", "kind": "path",
++                                "value": str(Path(root) / "2026-10-03T00-00-00-000Z_gone.jsonl")},
++                               agent="pi")
++        self.assertEqual(body["unavailable"], "no-log")
++
++    def test_a_truncated_older_file_flags_the_walk(self):
++        with tempfile.TemporaryDirectory() as root:
++            # An older session big enough to be tail-read under the patch; a current one small
++            # enough to be read whole, so only the chained file is truncated.
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": f"old {index}"}], mid=f"o{index}")
++                for index in range(50)
++            ], "2026-10-04T00-00-00-000Z_old.jsonl")
++            write_pi_session(root, [
++                pi_message("user", [{"type": "text", "text": "new"}], mid="n1"),
++            ], "2026-10-05T00-00-00-000Z_new.jsonl")
++            ref = {"agent": "pi", "kind": "path", "value": str(Path(root) / "2026-10-05T00-00-00-000Z_new.jsonl")}
++            mod = load_transcript({"HERDR_PI_ROOTS": root})
++            with mock.patch.object(mod, "MAX_BYTES", 1000), \
++                 mock.patch.object(mod, "TAIL_BYTES", 512):
++                first = mod.history(ref, agent="pi")
++                older = mod.history(ref, agent="pi", before=first["messages"][0]["uuid"])
++        self.assertTrue(first["messages"])
++        self.assertTrue(older["file_truncated"])
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_web_assets.py b/tests/test_web_assets.py
+index 4f45717..b492752 100644
+--- a/tests/test_web_assets.py
++++ b/tests/test_web_assets.py
+@@ -8,8 +8,10 @@ import os
+ import pathlib
+ import re
+ import unittest
++from urllib.parse import urlsplit
+ 
+ from test_herdr_relay import loaded_relay
++from test_relay_auth import request
+ 
+ ROOT = pathlib.Path(__file__).resolve().parent.parent
+ WEB = ROOT / "web"
+@@ -17,7 +19,7 @@ INDEX = (WEB / "index.html").read_text(encoding="utf-8")
+ 
+ 
+ def referenced_assets():
+-    """Every same-origin asset index.html loads, as the request path a browser would send.
++    """Every same-origin asset index.html loads, without a query or fragment.
+ 
+     The page writes these RELATIVE, so that it also opens from file:// -- which is how the
+     browser tests load it. Served at `/`, a relative `js/state.js` is requested as `/js/state.js`,
+@@ -30,7 +32,8 @@ def referenced_assets():
+     for ref in found:
+         if ref.startswith(("http://", "https://", "data:")):
+             continue
+-        paths.add(ref if ref.startswith("/") else "/" + ref.lstrip("./"))
++        path = urlsplit(ref).path
++        paths.add(path if path.startswith("/") else "/" + path.lstrip("./"))
+     return paths
+ 
+ 
+@@ -55,6 +58,17 @@ class WebAssetRoutingTests(unittest.TestCase):
+                     self.assertNotIn("immutable", cache)
+                     self.assertIn("no-cache", cache)
+ 
++    def test_versioned_theme_assets_serve_current_bytes_without_auth(self):
++        """A new URL must bypass an old browser cache and still reach the static route."""
++        refs = re.findall(r'(?:href|src)="([^"]+\?v=[^"]+)"', INDEX)
++        self.assertEqual({urlsplit(ref).path for ref in refs}, {"app.css", "js/state.js"})
++        with loaded_relay(relay_token="test-asset-token") as relay:
++            for ref in refs:
++                with self.subTest(ref=ref):
++                    response = request(relay, "/" + ref)
++                    self.assertEqual(response.status, 200)
++                    self.assertEqual(response.body, (WEB / urlsplit(ref).path).read_bytes())
++
+     def test_fonts_and_rasters_still_get_a_year(self):
+         with loaded_relay() as relay:
+             hit = relay.web_asset("/HackNerdFont-Regular.woff2")
+diff --git a/tests/test_web_theme.py b/tests/test_web_theme.py
+index 3e5ed9e..c0501da 100644
+--- a/tests/test_web_theme.py
++++ b/tests/test_web_theme.py
+@@ -33,6 +33,7 @@ PHONE = {"width": 390, "height": 844}
+ # the CSS, the two theme-color metas and the web manifest all have to agree on.
+ DARK_BG, DARK_TEXT = "rgb(10, 10, 10)", "rgb(250, 250, 250)"
+ LIGHT_BG, LIGHT_TEXT = "rgb(245, 245, 245)", "rgb(10, 10, 10)"
++TERM_BG, TERM_TEXT = "rgb(243, 234, 211)", "rgb(63, 56, 46)"
+ 
+ 
+ def _chrome():
+@@ -132,19 +133,45 @@ class WebThemeTests(unittest.TestCase):
+             self.page.evaluate("() => getComputedStyle(document.querySelector('.setting-group'))"
+                                ".backgroundColor"), "rgb(255, 255, 255)")
+ 
+-    def test_the_mirror_is_dark_under_both_themes(self):
+-        """ANSI_COLORS is VS Code's Dark+ set and an agent's truecolor cannot be re-themed, so the
+-        pane keeps its own ground -- and its own `color-scheme`, or a light theme hands the dark
+-        output a light scrollbar."""
++    def test_the_mirror_matches_parchment_under_both_ui_themes(self):
++        """The phone's UI appearance must not undo the desktop terminal's fixed light palette."""
+         for scheme in ("dark", "light"):
+             self.page.emulate_media(color_scheme=scheme)
+             got = self.page.evaluate("""() => {
+               const cs = getComputedStyle(document.getElementById('termContent'));
+               return {bg: cs.backgroundColor, color: cs.color, scheme: cs.colorScheme};
+             }""")
+-            self.assertEqual(got["bg"], DARK_BG, scheme)
+-            self.assertEqual(got["color"], DARK_TEXT, scheme)
+-            self.assertEqual(got["scheme"], "dark", scheme)
++            self.assertEqual(got["bg"], TERM_BG, scheme)
++            self.assertEqual(got["color"], TERM_TEXT, scheme)
++            self.assertEqual(got["scheme"], "light", scheme)
++
++    def test_ansi_reset_and_inverse_use_the_terminal_defaults(self):
++        got = self.page.evaluate("""() => {
++          const box = document.getElementById('termContent');
++          box.replaceChildren(ansiFragment('plain\\x1b[7minverse\\x1b[27mnormal\\x1b[31mred\\x1b[39mreset'));
++          return [...box.children].map(el => {
++            const cs = getComputedStyle(el);
++            return {text: el.textContent, fg: cs.color, bg: cs.backgroundColor};
++          });
++        }""")
++        self.assertEqual(got[0]["fg"], TERM_TEXT)
++        self.assertEqual((got[1]["fg"], got[1]["bg"]), (TERM_BG, TERM_TEXT))
++        self.assertEqual(got[2]["fg"], TERM_TEXT)
++        self.assertEqual(got[3]["fg"], "rgb(148, 61, 53)")
++        self.assertEqual(got[4]["fg"], TERM_TEXT)
++
++    def test_ansi_truecolor_is_not_recolored(self):
++        got = self.page.evaluate("""() => {
++          const box = document.getElementById('termContent');
++          box.replaceChildren(ansiFragment('\\x1b[38;2;18;52;86mtext\\x1b[48;2;235;223;196minput\\x1b[49mdefault'));
++          return [...box.children].map(el => {
++            const cs = getComputedStyle(el);
++            return {fg: cs.color, bg: cs.backgroundColor};
++          });
++        }""")
++        self.assertEqual(got[0]["fg"], "rgb(18, 52, 86)")
++        self.assertEqual(got[1]["bg"], "rgb(235, 223, 196)")
++        self.assertEqual(got[2]["bg"], "rgba(0, 0, 0, 0)")
+ 
+     def test_text_on_a_saturated_fill_clears_aa_in_both_themes(self):
+         """A saturated token is DARK in the light theme and LIGHT in the dark one, so the literal
+diff --git a/tests/web_source.py b/tests/web_source.py
+index 9cc0325..d3a2870 100644
+--- a/tests/web_source.py
++++ b/tests/web_source.py
+@@ -6,6 +6,7 @@ web/js/*.js, so a `grep`-shaped test that keeps reading only index.html does not
+ passes vacuously, having looked in the wrong file. Go through here instead.
+ """
+ import pathlib
++from urllib.parse import urlsplit
+ 
+ WEB_DIR = pathlib.Path(__file__).resolve().parent.parent / "web"
+ 
+@@ -15,7 +16,7 @@ def script_files():
+     import re
+     index = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+     refs = re.findall(r'<script src="([^"]+)"></script>', index)
+-    return [WEB_DIR / ref.lstrip("./") for ref in refs]
++    return [WEB_DIR / urlsplit(ref).path.lstrip("./") for ref in refs]
+ 
+ 
+ def web_source():
+diff --git a/web/app.css b/web/app.css
+index d2a1821..bd4204e 100644
+--- a/web/app.css
++++ b/web/app.css
+@@ -34,9 +34,9 @@
+      one, so no single literal serves both: `color: #fff` on the Send button measured 2.6:1 against
+      the dark theme's blue. This pair measures >= 6.6:1 on all four hues in both themes. */
+   --on-accent: light-dark(#ffffff, #0a0a0a);
+-  /* The mirror is dark under BOTH themes: ANSI_COLORS is VS Code's Dark+ set, authored for a dark
+-     ground, and it sits beside truecolor an agent emits that no palette can re-theme. */
+-  --term-bg: #0a0a0a; --term-text: #fafafa;
++  /* Match the desktop terminal's parchment palette independently of the phone's UI appearance.
++     Agent truecolor backgrounds remain explicit; reset/default cells inherit this ground. */
++  --term-bg: #f3ead3; --term-text: #3f382e;
+   /* Depth and motion, added as tokens so the whole surface moves together and both themes get a
+      shadow tuned to their own ground -- one rgba literal cannot serve a #fff card and a #171717
+      one. Light gets a soft cool drop; dark leans on a lifted surface + hairline highlight rather
+@@ -392,7 +392,7 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
+ .session-item.active { border-color: var(--green); background: color-mix(in srgb, var(--green) 10%, var(--bg)); }
+ .session-name { font-weight: 500; flex: 1; }
+ .session-url { font-size: 0.7rem; color: var(--muted); font-family: var(--font-mono); }
+-.term-content { flex: 1; min-width: 0; overflow: auto; padding: 10px 12px; background: var(--term-bg); color-scheme: dark; font-family: var(--font-term); font-size: clamp(0.68rem, 2.7vw, 0.8rem); line-height: 1.35; white-space: pre; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
++.term-content { flex: 1; min-width: 0; overflow: auto; padding: 10px 12px; background: var(--term-bg); color-scheme: light; font-family: var(--font-term); font-size: clamp(0.68rem, 2.7vw, 0.8rem); line-height: 1.35; white-space: pre; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+ .quick-actions { padding: 6px 10px; border-top: 1px solid var(--border); display: flex; gap: 5px; flex-wrap: wrap; flex-shrink: 0; }
+ .quick-actions button { padding: 8px 12px; border-radius: 8px; border: none; font-size: 0.8rem; font-weight: 600; cursor: pointer; flex: 1; min-width: 70px; display: flex; align-items: center; justify-content: center; gap: 6px; }
+ /* A full option label ("Yes, and don't ask again for ...") cannot share a row with three more of
+diff --git a/web/index.html b/web/index.html
+index 1d54b7c..a9ba061 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -29,7 +29,7 @@ import { play, bind } from 'https://esm.sh/cuelume@0.1.2';
+ window.cue = play;
+ document.addEventListener('DOMContentLoaded', () => bind());
+ </script>
+-<link rel="stylesheet" href="app.css">
++<link rel="stylesheet" href="app.css?v=parchment-20261024">
+ </head>
+ <body>
+ 
+@@ -209,7 +209,7 @@ document.addEventListener('DOMContentLoaded', () => bind());
+   </div>
+ </div>
+ 
+-<script src="js/state.js"></script>
++<script src="js/state.js?v=parchment-20261024"></script>
+ <script src="js/markdown.js"></script>
+ <script src="js/diff.js"></script>
+ <script src="js/triage.js"></script>
+diff --git a/web/js/state.js b/web/js/state.js
+index a8ba476..7b386ac 100644
+--- a/web/js/state.js
++++ b/web/js/state.js
+@@ -290,16 +290,32 @@ function connect() {
+     ws.close();
+   }
+   setStatus('connecting');
+-  // Append token as query param if stored separately
++  // Same-origin relays authenticate with the session cookie the first load planted -- the
++  // long-lived token has no business in a WebSocket URL, where it lands in proxy logs and anywhere
++  // else the handshake URL goes. Cross-origin relays (a session added by hand, the demo) send no
++  // cookie, so those keep the token on the query string.
+   const token = localStorage.getItem('herdr_relay_token');
++  let sameOrigin = false;
++  try { sameOrigin = new URL(url, location.href).origin === location.origin; } catch (e) {}
+   let wsUrl = url;
+-  if (token) wsUrl += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
++  if (token && !sameOrigin) wsUrl += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
+   const sock = new WebSocket(wsUrl);
+   ws = sock;
+-  sock.onopen = () => { if (ws !== sock) return; setStatus('connected'); if(window.cue) cue('ready');
++  sock.onopen = () => { if (ws !== sock) return; sock._opened = true; sessionStorage.removeItem('herdr_rebootstrap'); setStatus('connected'); if(window.cue) cue('ready');
+     // Push: the relay's copy of this device's subscription can be stale (see push.js).
+     if (typeof resyncPushSubscription === 'function') resyncPushSubscription(); };
+-  sock.onclose = () => { if (ws !== sock) return; setStatus('disconnected'); scheduleReconnect(); };
++  sock.onclose = () => {
++    if (ws !== sock) return;
++    // Never opened, same origin, token in localStorage: the session cookie is gone but the
++    // bootstrap hop can mint a new one -- reload through it exactly once (the guard keeps a wrong
++    // token from looping; onopen clears it again).
++    if (sameOrigin && token && !sock._opened && !sessionStorage.getItem('herdr_rebootstrap')) {
++      sessionStorage.setItem('herdr_rebootstrap', '1');
++      location.replace(location.pathname + '?token=' + encodeURIComponent(token));
++      return;
++    }
++    setStatus('disconnected'); scheduleReconnect();
++  };
+   sock.onerror = () => { if (ws !== sock) return; setStatus('disconnected'); };
+   sock.onmessage = (e) => { if (ws !== sock) return; handleMessage(JSON.parse(e.data)); };
+ }
+@@ -344,7 +360,8 @@ function tryDemo() {
+   connect();
+ }
+ 
+-const ANSI_COLORS = ['#000000','#cd3131','#0dbc79','#e5e510','#2472c8','#bc3fbc','#11a8cd','#e5e5e5','#666666','#f14c4c','#23d18b','#f5f543','#3b8eea','#d670d6','#29b8db','#ffffff'];
++// The desktop terminal's parchment ANSI palette. Keep truecolor and the 256-color cube intact.
++const ANSI_COLORS = ['#3f382e','#943d35','#3f6040','#7c5328','#345f7a','#6c4f7a','#345f7a','#645949','#645949','#943d35','#3f6040','#7c5328','#345f7a','#6c4f7a','#345f7a','#3f382e'];
+ 
+ function ansiFragment(input) {
+   const fragment=document.createDocumentFragment();
+@@ -356,8 +373,8 @@ function ansiFragment(input) {
+     const span=document.createElement('span');
+     span.textContent=text;
+     if(state.hidden)span.style.visibility='hidden';
+-    const defaultFg='#ccc';
+-    const defaultBg='#000';
++    const defaultFg='var(--term-text)';
++    const defaultBg='var(--term-bg)';
+     const fg=state.inverse?(state.bg||defaultBg):state.fg;
+     const bg=state.inverse?(state.fg||defaultFg):state.bg;
+     if(fg)span.style.color=fg;
