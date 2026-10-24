@@ -8,7 +8,7 @@
 
 Hi, this is Otterpack. I wanted to collect the Herdr plugins, Pi extensions, themes and other tools I use day to day, and share them in one place. Some are my own projects, some are changes to existing open-source tools, and others are third-party tools I use as they are. I like what they do together, even though I didn't create every part.
 
-I'm especially fond of the parchment theme. I think it looks lovely, so I wanted to share that too.
+I've always thought I had a good eye—this parchment theme, for example 😉 Haha~
 
 Independent tools still live in their own repositories. Otterpack keeps the theme files, configuration examples, exact versions, selected patches and notes on using them together. You can try just one or two things that interest you. The detailed guides are currently in Chinese.
 
