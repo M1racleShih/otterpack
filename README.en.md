@@ -38,6 +38,8 @@ The helper fetches a pinned GitHub commit, checks the local patch hash, applies 
 
 Linux is the tested platform. macOS and Windows support is documented per component without claiming tests that were not run. Screenshots use real interfaces with synthetic demonstration data; the Pi image is rendered from actual offline terminal output. See [image provenance](docs/screenshots.md).
 
+The [mobile gallery](docs/herdr.md#在手机上看三件事) shows progress, code changes and conversation history in the actual Herdr Remote interface. Its terminal text and conversations are synthetic fixtures; they are not live agent runs. The updated captures use a consistent 390 × 700 browser viewport.
+
 ## Credits and license
 
 Curated by [M1racleShih](https://github.com/M1racleShih). New Otterpack material is offered under [MIT](LICENSE), to the extent applicable. Components retain their own licenses and authors. In particular, **the Herdr Remote patch and its source remain AGPL-3.0-or-later**. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

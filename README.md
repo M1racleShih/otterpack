@@ -18,11 +18,15 @@
 
 *Pi 1.3.0 的真实离线终端输出，经终端渲染器保存成图；演示模型没有调用上游服务。下方指南记录主题与插件的搭配。*
 
-| 离开电脑，也能接着看 | 在手机上看清工作状态 |
+| 读一份完整的报告 | 看工具执行与任务进度 |
 | --- | --- |
-| ![conv-docs 的真实浏览器截图，内容为演示文档](assets/conv-docs-mobile.png) | ![Herdr Remote 的真实浏览器截图，状态来自演示夹具](assets/herdr-remote-mobile.png) |
+| ![conv-docs 的真实浏览器截图，内容为演示文档](assets/conv-docs-mobile.png) | ![Herdr Remote 执行进度：真实网页与合成终端内容](assets/herdr-remote-mobile.png) |
 
-*两张手机图来自实际网页界面，在手机尺寸的浏览器中拍摄，数据均为演示。图源、复现方式与边界见[截图说明](docs/screenshots.md)。*
+| 核对代码差异 | 回读会话结论 |
+| --- | --- |
+| ![Herdr Remote 代码差异：真实网页与合成 ANSI 演示](assets/herdr-diff-mobile.png) | ![Herdr Remote 会话历史：真实网页渲染演示对话](assets/herdr-history-mobile.png) |
+
+*手机图在 390 × 700 的浏览器视口中拍摄，展示实际网页。文档、终端内容与会话历史均为演示数据；没有连接真实 agent。图源与复现方式见[截图说明](docs/screenshots.md)，使用场景见 [Herdr 手机工作台](docs/herdr.md#在手机上看三件事)。*
 
 ## 工具袋里有什么
 

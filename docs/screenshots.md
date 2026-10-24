@@ -7,10 +7,13 @@
 | [Pi 首页](../assets/pi-parchment.png) | Pi 1.3.0 实际 PTY 输出 → pyte 0.8.2 解析 → Pillow 排版 | 当前主题和扩展首页的真实终端输出；不是桌面窗口截屏，也不是生成式 UI 示意 |
 | [Pi 读取文档](../assets/pi-workflow.png) | 同一方法，真实 read 工具读取演示文件；provider 返回固定文本 | 输入、读取结果与 HUD 的组合；模型用量是夹具数值 |
 | [conv-docs 手机阅读](../assets/conv-docs-mobile.png) | 还原源码运行独立 localhost 服务，浏览器真实截屏 | 实际网页渲染了本包演示文档 |
-| [Herdr Remote 总览](../assets/herdr-overview.png) / [终端](../assets/herdr-remote-mobile.png) | 还原源码的真实网页连接本地 WebSocket 夹具，浏览器真实截屏 | 网页布局与羊皮纸 ANSI 渲染；不代表真实 agent 执行或远程连接验收 |
+| [Herdr Remote 总览](../assets/herdr-overview.png) / [执行进度](../assets/herdr-remote-mobile.png) / [代码差异](../assets/herdr-diff-mobile.png) | 还原源码的真实网页连接本地 WebSocket 夹具，浏览器真实截屏；终端文本与 ANSI 由夹具构造 | 网页布局与羊皮纸 ANSI 渲染；不代表真实 Pi 输出、agent 执行或远程连接验收 |
+| [Herdr Remote 会话历史](../assets/herdr-history-mobile.png) | 同一网页原生 Conversation history 面板，夹具通过 `get_history` 协议提供合成对话 | 实际 Markdown、表格、工具记录和 Tools 开关；不包含真实会话 |
 | [小獭 logo](../assets/otterpack.png) | AI 生成透明插画 | 品牌形象；[提示词与许可](brand.md)单独记录 |
 
 Pi 首页参考了维护者的实际工作台取景：紧凑等宽字、居中的三色 π、羊皮纸背景和块状输入框。没有发布原始参考截图。演示用不透明纸色，避免桌面透出私人内容。
+
+v0.1.1 的手机展示参考维护者提供的三张手机截图，分别突出执行进度、代码差异与会话回读。使用同一组可公开的短行示例，缩短视口，减少空白；保留网页自己的导航、输入区与历史面板。没有复制原图中的域名、私人路径、项目代码和会话内容，也没有补画手机系统状态栏或浏览器外框。
 
 ## 复现 Pi 图片
 
@@ -50,7 +53,7 @@ python3 scripts/demo-remote.py
 Remote 夹具需要 Python websockets 14+。三个端口都只绑定 localhost，退出命令即可停止；它们不会启动或操作日常 Herdr 与 conv-docs 服务。
 
 - conv-docs：打开 `http://127.0.0.1:18794`，输入脚本内公开的演示 token `otterpack-local-demo-not-a-secret`，切换中文，打开 `otterpack/field-notes.md`。此值仅供本地演示，不能用于真实服务。
-- Remote：打开 `http://127.0.0.1:18795`，在设置中连接 `ws://127.0.0.1:18796` 并选择 Light。先截总览，再打开 parchment 终端。夹具忽略所有修改类消息，不转发到任何 agent。
-- 本次采用独立 Chrome for Testing 153.0.8010.52、430 × 932 CSS px 手机视口，使用 agent-browser 0.38.1 保存实际网页截图。
+- Remote：打开 `http://127.0.0.1:18795`，在设置中连接 `ws://127.0.0.1:18796` 并选择 Light。worker 展示执行进度，reviewer 展示差异；打开 notes 后点击 Conversation history，滚到顶部拍摄完整短会话。夹具忽略所有修改类消息，不转发到任何 agent。
+- 当前图片采用独立 Chrome for Testing 153.0.8010.52、**390 × 700 CSS px、3 倍像素密度**，使用 agent-browser 0.38.1 保存为 1170 × 2100 PNG。总览单独采用 390 × 430 视口。v0.1.0 的原图曾使用 430 × 932 视口；旧版本资源仍保留在对应发行版。
 
 网页图未生成或补画界面元素。图中文字和状态来自明确的演示材料，公开时保留对应组件的许可和署名，见 [Third-party notices](../THIRD_PARTY_NOTICES.md)。

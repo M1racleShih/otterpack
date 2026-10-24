@@ -22,8 +22,22 @@ python3 scripts/materialize.py herdr-remote-solution ../otterpack-herdr-remote
 
 ## 我怎样使用状态
 
-<img src="../assets/herdr-overview.png" width="430" alt="真实 Herdr Remote 网页中的演示 agent 状态列表">
+<img src="../assets/herdr-overview.png" width="390" alt="真实 Herdr Remote 网页中的演示 agent 状态列表">
 
 工作中表示有活动；等待回复表示需要我介入；完成表示可以开始检查结果。状态帮助我把注意力放到正确的位置，代码、文件和验证结果才是验收依据。
+
+## 在手机上看三件事
+
+| 执行进度 | 代码差异 | 会话结论 |
+| --- | --- | --- |
+| ![工具活动、任务列表与 HUD](../assets/herdr-remote-mobile.png) | ![新增与删除的代码行](../assets/herdr-diff-mobile.png) | ![会话历史中的中文结论、列表与表格](../assets/herdr-history-mobile.png) |
+
+**看进度：** 打开 worker，工具活动、待办与 HUD 放在同一屏，便于判断现在进行到哪一步。
+
+**核对差异：** 打开 reviewer，读新增与删除的代码行。终端镜像保留原有行宽，实际长行可横向滚动；截图选择能在手机上读完的短示例。
+
+**回读结论：** 在 notes 中打开 Conversation history。工具调用与 Markdown 结论共同呈现；Tools 开关可隐藏工具记录，集中阅读对话。
+
+三张图参考了维护者提供的真实手机使用场景，重新用公开的演示数据拍摄。终端文字与 ANSI 差异由本包夹具构造，历史面板由真实网页渲染；不把示例中的任务、用量或改动当作实际执行结果。
 
 本包提供真实 Remote 网页的演示截图。当前制作会话没有连接到用户正在工作的 Herdr pane，因此不提供当前桌面会话截图；详见[图源说明](screenshots.md)。
